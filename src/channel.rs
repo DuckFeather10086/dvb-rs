@@ -24,18 +24,9 @@ pub struct ChannelsFile {
 }
 
 impl Channel {
-    /// `section_title` is the `[...]` header text. Optional `DVBR_NAME` / `CHANNEL_LABEL`
-    /// (UTF-8) override the stored [`Channel::name`] for display and CLI lookup; tuning still
-    /// uses the full key/value map (extra keys are ignored by the frontend chain).
-    pub fn from_dvbv5_section(section_title: &str, kv: &HashMap<String, String>) -> Result<Self, String> {
-        let name = kv
-            .get("DVBR_NAME")
-            .or_else(|| kv.get("CHANNEL_LABEL"))
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| section_title.to_string());
-
+    /// Build from a flat `KEY = VAL` map (same keys as dvbv5 `.conf` body). `display_name` is the
+    /// stable channel id / label (no `DVBR_NAME` lookup).
+    pub fn from_named_tuning(display_name: &str, kv: &HashMap<String, String>) -> Result<Self, String> {
         let delivery = kv
             .get("DELIVERY_SYSTEM")
             .cloned()
@@ -73,7 +64,7 @@ impl Channel {
         }
 
         Ok(Channel {
-            name,
+            name: display_name.to_string(),
             delivery,
             frequency,
             bandwidth_hz,
@@ -81,5 +72,20 @@ impl Channel {
             video_pids,
             audio_pids,
         })
+    }
+
+    /// `section_title` is the `[...]` header text. Optional `DVBR_NAME` / `CHANNEL_LABEL`
+    /// (UTF-8) override the stored [`Channel::name`] for display and CLI lookup; tuning still
+    /// uses the full key/value map (extra keys are ignored by the frontend chain).
+    pub fn from_dvbv5_section(section_title: &str, kv: &HashMap<String, String>) -> Result<Self, String> {
+        let display_name = kv
+            .get("DVBR_NAME")
+            .or_else(|| kv.get("CHANNEL_LABEL"))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| section_title.to_string());
+
+        Self::from_named_tuning(&display_name, kv)
     }
 }

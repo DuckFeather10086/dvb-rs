@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use dvbr::config;
 use dvbr::channel::ChannelsFile;
+use dvbr::config;
 use dvbr::demux::{Demux, DvrReader};
 use dvbr::frontend::Frontend;
 use dvbr::scan;
@@ -40,7 +40,7 @@ enum Cmd {
         output: String,
         #[arg(long, default_value_t = 15000)]
         lock_timeout_ms: u64,
-        /// Channel: UTF-8 `DVBR_NAME` / `CHANNEL_LABEL`, a `DVBR_ALIASES` token, or `[section]` title
+        /// Channel id: `name` / alias in `channels.json`, or legacy `.conf` section / DVBR_* labels
         name: String,
     },
     /// Read one PAT + SDT after locking (non blind-scan)
@@ -80,6 +80,13 @@ enum Cmd {
         #[arg(short = 'o', long)]
         output: PathBuf,
     },
+    /// Migrate legacy `.conf` to `channels.json` / `channels.toml` style [`ChannelsDocument`]
+    Migrate {
+        #[arg(short = 'i', long)]
+        input: PathBuf,
+        #[arg(short = 'o', long, default_value = "channels.json")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> dvbr::Result<()> {
@@ -96,7 +103,7 @@ fn main() -> dvbr::Result<()> {
             lock_timeout_ms,
             name,
         } => {
-            let entries = config::parse_dvbv5_conf(&channels)?;
+            let entries = config::load_channel_entries(&channels)?;
             let entry = config::find_entry(&entries, &name)?;
             let fe = Frontend::open_rw(adapter, frontend)?;
             tune_frontend(&fe, entry)?;
@@ -148,7 +155,7 @@ fn main() -> dvbr::Result<()> {
             name,
         } => {
             let (entry, freq, bw) = if let Some(path) = channels {
-                let entries = config::parse_dvbv5_conf(&path)?;
+                let entries = config::load_channel_entries(&path)?;
                 let n = name
                     .ok_or_else(|| dvbr::Error::Msg("--name required with --channels".into()))?;
                 let e = config::find_entry(&entries, &n)?;
@@ -200,6 +207,20 @@ fn main() -> dvbr::Result<()> {
             };
             config::write_channels_json(&output, &file)?;
             info!("converted {} entries", file.channels.len());
+        }
+        Cmd::Migrate { input, output } => {
+            let entries = config::parse_dvbv5_conf(&input)?;
+            let n = entries.len();
+            let doc = config::document_from_conf_entries(entries);
+            if output.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase() == "toml"
+            {
+                let s = toml::to_string_pretty(&doc)
+                    .map_err(|e| dvbr::Error::Parse(e.to_string()))?;
+                std::fs::write(&output, s)?;
+            } else {
+                config::write_channels_document_json(&output, &doc)?;
+            }
+            info!("migrated {} channels -> {}", n, output.display());
         }
     }
     Ok(())

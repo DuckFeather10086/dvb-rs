@@ -11,4 +11,5 @@ pub mod sys;
 pub mod tuner;
 
 pub use channel::{Channel, ChannelsFile};
+pub use config::{ChannelRecord, ChannelsDocument};
 pub use error::{Error, Result};
