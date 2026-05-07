@@ -8,8 +8,28 @@ use std::path::Path;
 /// Channel plus raw `[section]` key/values for full DVBv5 tuning (`dvbv5-zap` compatibility).
 #[derive(Debug, Clone)]
 pub struct DvbV5Entry {
+    /// Literal string inside `[...]` (may be legacy mojibake); still accepted for lookup.
+    pub section_title: String,
     pub channel: Channel,
+    /// Extra lookup strings from `DVBR_ALIASES` (comma / semicolon / `|` / `｜` separated, UTF-8).
+    pub aliases: Vec<String>,
     pub raw: HashMap<String, String>,
+}
+
+impl DvbV5Entry {
+    pub fn matches_lookup(&self, q: &str) -> bool {
+        self.channel.name == q
+            || self.section_title == q
+            || self.aliases.iter().any(|a| a == q)
+    }
+}
+
+fn parse_dvbr_aliases(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c == ';' || c == '|' || c == '｜')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Load [`ChannelsFile`] from JSON.
@@ -33,10 +53,16 @@ fn flush_section(
 ) -> Result<()> {
     if let Some(name) = name {
         if !map.is_empty() {
-            let ch =
-                Channel::from_dvbv5_section(&name, map).map_err(Error::Parse)?;
+            let section_title = name.clone();
+            let aliases = map
+                .get("DVBR_ALIASES")
+                .map(|v| parse_dvbr_aliases(v))
+                .unwrap_or_default();
+            let ch = Channel::from_dvbv5_section(&section_title, map).map_err(Error::Parse)?;
             out.push(DvbV5Entry {
+                section_title,
                 channel: ch,
+                aliases,
                 raw: std::mem::take(map),
             });
         }
@@ -77,7 +103,7 @@ pub fn parse_dvbv5_conf(path: &Path) -> Result<Vec<DvbV5Entry>> {
 pub fn find_entry<'a>(entries: &'a [DvbV5Entry], name: &str) -> Result<&'a DvbV5Entry> {
     entries
         .iter()
-        .find(|e| e.channel.name == name)
+        .find(|e| e.matches_lookup(name))
         .ok_or_else(|| Error::ChannelNotFound(name.to_string()))
 }
 

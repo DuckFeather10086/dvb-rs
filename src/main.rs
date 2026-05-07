@@ -40,7 +40,7 @@ enum Cmd {
         output: String,
         #[arg(long, default_value_t = 15000)]
         lock_timeout_ms: u64,
-        /// Channel section name exactly as in the `.conf` file
+        /// Channel: UTF-8 `DVBR_NAME` / `CHANNEL_LABEL`, a `DVBR_ALIASES` token, or `[section]` title
         name: String,
     },
     /// Read one PAT + SDT after locking (non blind-scan)
@@ -62,7 +62,7 @@ enum Cmd {
         delivery: String,
         #[arg(short = 'o', long, default_value = "channels.json")]
         output: PathBuf,
-        /// If `--channels` is set: section name to tune
+        /// If `--channels` is set: lookup name (`DVBR_NAME`, alias, or `[section]`)
         #[arg(long)]
         name: Option<String>,
     },
