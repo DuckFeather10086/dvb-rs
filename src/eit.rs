@@ -1,7 +1,6 @@
 //! EIT (Event Information Table) parser for ISDB-T / ARIB STD-B10.
 //! Parses EIT sections from PID 0x0012 and decodes ARIB STD-B24 text.
 
-use crate::arib_b24;
 use crate::error::{Error, Result};
 use crate::si_tables::section_crc_ok;
 
