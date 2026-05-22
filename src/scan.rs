@@ -23,14 +23,13 @@ fn read_one_section(dm: &mut Demux, buf: &mut Vec<u8>, scratch: &mut [u8]) -> Re
         }
         buf.extend_from_slice(&scratch[..n]);
     }
-    let tot = section_byte_len_from_prefix(&buf[..3]).ok_or_else(|| Error::Si("bad SI header".into()))?;
+    let tot =
+        section_byte_len_from_prefix(&buf[..3]).ok_or_else(|| Error::Si("bad SI header".into()))?;
     if tot > 4096 {
         return Err(Error::Si("section too large".into()));
     }
     while buf.len() < tot {
-        let n = dm
-            .read(scratch)
-            .map_err(|e: std::io::Error| Error::Io(e))?;
+        let n = dm.read(scratch).map_err(|e: std::io::Error| Error::Io(e))?;
         if n == 0 {
             return Err(Error::Si("short read on demux".into()));
         }
@@ -65,11 +64,7 @@ pub fn scan_current_transport(
         fe.set_properties(&mut props)?;
     }
 
-    wait_lock(
-        &fe,
-        Duration::from_secs(15),
-        Duration::from_millis(150),
-    )?;
+    wait_lock(&fe, Duration::from_secs(15), Duration::from_millis(150))?;
 
     let tune_freq = entry.map(|e| e.channel.frequency).unwrap_or(frequency);
     let tune_bw = entry

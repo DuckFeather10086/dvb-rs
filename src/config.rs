@@ -19,9 +19,7 @@ pub struct DvbV5Entry {
 
 impl DvbV5Entry {
     pub fn matches_lookup(&self, q: &str) -> bool {
-        self.channel.name == q
-            || self.section_title == q
-            || self.aliases.iter().any(|a| a == q)
+        self.channel.name == q || self.section_title == q || self.aliases.iter().any(|a| a == q)
     }
 }
 
@@ -139,8 +137,7 @@ pub fn write_channels_json(path: &Path, file: &ChannelsFile) -> Result<()> {
 }
 
 pub fn write_channels_document_json(path: &Path, doc: &ChannelsDocument) -> Result<()> {
-    let s =
-        serde_json::to_string_pretty(doc).map_err(|e| Error::Parse(e.to_string()))?;
+    let s = serde_json::to_string_pretty(doc).map_err(|e| Error::Parse(e.to_string()))?;
     fs::write(path, s)?;
     Ok(())
 }
@@ -266,19 +263,13 @@ fn strip_dvbr_meta(map: &mut HashMap<String, String>) {
 }
 
 fn needs_generated_id(section_title: &str, channel_display: &str) -> bool {
-    if section_title.contains('|')
-        || section_title.contains('!')
-        || section_title.contains('%')
-    {
+    if section_title.contains('|') || section_title.contains('!') || section_title.contains('%') {
         return true;
     }
     if channel_display != section_title {
         return false;
     }
-    let non_ascii = channel_display
-        .chars()
-        .filter(|c| !c.is_ascii())
-        .count();
+    let non_ascii = channel_display.chars().filter(|c| !c.is_ascii()).count();
     non_ascii > 2
 }
 
@@ -303,9 +294,12 @@ pub fn document_from_conf_entries(entries: Vec<DvbV5Entry>) -> ChannelsDocument 
     let mut used = HashSet::new();
     let mut channels = Vec::with_capacity(entries.len());
     for e in entries {
-        let ascii_label = e.channel.name.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '_' || c == '-'
-        }) && !e.channel.name.is_empty();
+        let ascii_label = e
+            .channel
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && !e.channel.name.is_empty();
         let from_explicit_label = e.channel.name != e.section_title;
 
         let candidate = if from_explicit_label && ascii_label {

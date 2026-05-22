@@ -38,6 +38,8 @@ pub struct DmxPesFilterParams {
     pub flags: u32,
 }
 
+pub const DMX_IMMEDIATE_START_PES: u32 = 4;
+
 impl DmxPesFilterParams {
     pub fn ts_tap_all_pids_mythological(pid: u16) -> Self {
         Self {
@@ -47,6 +49,18 @@ impl DmxPesFilterParams {
             output: DmxOutput::TsTap as u32,
             pes_type: DmxPesType::Other as u32,
             flags: 0,
+        }
+    }
+
+    /// Capture a single PID as TS to the DVR device (DMX_OUT_TS_TAP).
+    pub fn ts_tap_pid(pid: u16) -> Self {
+        Self {
+            pid,
+            _pad: 0,
+            input: DmxInput::Frontend as u32,
+            output: DmxOutput::TsTap as u32,
+            pes_type: DmxPesType::Other as u32,
+            flags: DMX_IMMEDIATE_START_PES,
         }
     }
 }
@@ -98,6 +112,88 @@ impl DmxSctFilterParams {
         };
         fl.filter[0] = 0x42;
         fl.mask[0] = 0xff;
+        Self {
+            pid,
+            _pad0: 0,
+            filter: fl,
+            timeout: 0,
+            flags: DMX_CHECK_CRC | DMX_IMMEDIATE_START,
+        }
+    }
+
+    /// EIT present/following (table_id 0x4E), no service_id filter.
+    /// `kernel_timeout_ms`: kernel auto-stops filter after this many ms of no match (0 = disabled).
+    pub fn eit_pf(pid: u16, kernel_timeout_ms: u32) -> Self {
+        let mut fl = DmxFilter {
+            filter: [0; 16],
+            mask: [0; 16],
+            mode: [0; 16],
+        };
+        fl.filter[0] = 0x4e;
+        fl.mask[0] = 0xff;
+        // No DMX_CHECK_CRC: some drivers drop EIT when CRC mismatch under marginal signal.
+        Self {
+            pid,
+            _pad0: 0,
+            filter: fl,
+            timeout: kernel_timeout_ms,
+            flags: DMX_IMMEDIATE_START,
+        }
+    }
+
+    /// EIT present/following (table_id 0x4E) filtered by service_id.
+    pub fn eit_pf_for_service(pid: u16, service_id: u16) -> Self {
+        let mut fl = DmxFilter {
+            filter: [0; 16],
+            mask: [0; 16],
+            mode: [0; 16],
+        };
+        fl.filter[0] = 0x4e;
+        fl.mask[0] = 0xff;
+        fl.filter[3] = (service_id >> 8) as u8;
+        fl.mask[3] = 0xff;
+        fl.filter[4] = service_id as u8;
+        fl.mask[4] = 0xff;
+        Self {
+            pid,
+            _pad0: 0,
+            filter: fl,
+            timeout: 0,
+            flags: DMX_CHECK_CRC | DMX_IMMEDIATE_START,
+        }
+    }
+
+    /// Section filter that passes ALL sections on `pid` (no table_id or service_id filtering).
+    /// Useful for EIT on PID 0x0012 where we want all table_ids (0x4E p/f + 0x50–0x5F schedule).
+    pub fn any_on_pid(pid: u16) -> Self {
+        let fl = DmxFilter {
+            filter: [0; 16],
+            mask: [0; 16],
+            mode: [0; 16],
+        };
+        Self {
+            pid,
+            _pad0: 0,
+            filter: fl,
+            timeout: 0,
+            flags: DMX_IMMEDIATE_START,
+        }
+    }
+
+    /// EIT schedule (table_id 0x50–0x5F) filtered by service_id.
+    /// Uses mode[0]=0xFF to match table_id range 0x50–0x5F via mask 0xF0.
+    pub fn eit_schedule_for_service(pid: u16, service_id: u16) -> Self {
+        let mut fl = DmxFilter {
+            filter: [0; 16],
+            mask: [0; 16],
+            mode: [0; 16],
+        };
+        fl.filter[0] = 0x50;
+        fl.mask[0] = 0xf0; // match 0x50–0x5F
+        fl.filter[3] = (service_id >> 8) as u8;
+        fl.mask[3] = 0xff;
+        fl.filter[4] = service_id as u8;
+        fl.mask[4] = 0xff;
         Self {
             pid,
             _pad0: 0,

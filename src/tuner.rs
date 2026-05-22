@@ -110,14 +110,9 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
             .unwrap_or("ISDBT"),
     );
     if delsys == fe_delivery_system::SYS_UNDEFINED {
-        return Err(Error::Msg(
-            "unsupported or missing DELIVERY_SYSTEM".into(),
-        ));
+        return Err(Error::Msg("unsupported or missing DELIVERY_SYSTEM".into()));
     }
-    props.push(prop_u32(
-        DTV_DELIVERY_SYSTEM,
-        delsys as u32,
-    ));
+    props.push(prop_u32(DTV_DELIVERY_SYSTEM, delsys as u32));
 
     let freq = parse_u32(m, "FREQUENCY").ok_or_else(|| Error::Parse("FREQUENCY".into()))?;
     props.push(prop_u32(DTV_FREQUENCY, freq));
@@ -127,10 +122,7 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
     props.push(prop_u32(DTV_BANDWIDTH_HZ, bw));
 
     if let Some(inv) = m.get("INVERSION") {
-        props.push(prop_u32(
-            DTV_INVERSION,
-            parse_inversion(inv) as u32,
-        ));
+        props.push(prop_u32(DTV_INVERSION, parse_inversion(inv) as u32));
     } else {
         props.push(prop_u32(
             DTV_INVERSION,
@@ -157,20 +149,11 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
     }
 
     opt_u8!("ISDBT_LAYER_ENABLED", DTV_ISDBT_LAYER_ENABLED);
-    opt_u8!(
-        "ISDBT_PARTIAL_RECEPTION",
-        DTV_ISDBT_PARTIAL_RECEPTION
-    );
-    opt_u8!(
-        "ISDBT_SOUND_BROADCASTING",
-        DTV_ISDBT_SOUND_BROADCASTING
-    );
+    opt_u8!("ISDBT_PARTIAL_RECEPTION", DTV_ISDBT_PARTIAL_RECEPTION);
+    opt_u8!("ISDBT_SOUND_BROADCASTING", DTV_ISDBT_SOUND_BROADCASTING);
     opt_u8!("ISDBT_SB_SUBCHANNEL_ID", DTV_ISDBT_SB_SUBCHANNEL_ID);
     opt_u8!("ISDBT_SB_SEGMENT_IDX", DTV_ISDBT_SB_SEGMENT_IDX);
-    opt_u8!(
-        "ISDBT_SB_SEGMENT_COUNT",
-        DTV_ISDBT_SB_SEGMENT_COUNT
-    );
+    opt_u8!("ISDBT_SB_SEGMENT_COUNT", DTV_ISDBT_SB_SEGMENT_COUNT);
 
     if let Some(s) = m.get("ISDBT_LAYERA_FEC") {
         props.push(prop_u32(DTV_ISDBT_LAYERA_FEC, parse_fec(s) as u32));
@@ -181,13 +164,10 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
             parse_modulation(s) as u32,
         ));
     }
-    opt_u8!(
-        "ISDBT_LAYERA_SEGMENT_COUNT",
-        DTV_ISDBT_LAYERA_SEGMENT_COUNT
-    );
+    opt_u8!("ISDBT_LAYERA_SEGMENT_COUNT", DTV_ISDBT_LAYERA_SEGMENT_COUNT);
     opt_u8!(
         "ISDBT_LAYERA_TIME_INTERLEAVING",
-       DTV_ISDBT_LAYERA_TIME_INTERLEAVING
+        DTV_ISDBT_LAYERA_TIME_INTERLEAVING
     );
 
     if let Some(s) = m.get("ISDBT_LAYERB_FEC") {
@@ -199,10 +179,7 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
             parse_modulation(s) as u32,
         ));
     }
-    opt_u8!(
-        "ISDBT_LAYERB_SEGMENT_COUNT",
-        DTV_ISDBT_LAYERB_SEGMENT_COUNT
-    );
+    opt_u8!("ISDBT_LAYERB_SEGMENT_COUNT", DTV_ISDBT_LAYERB_SEGMENT_COUNT);
     opt_u8!(
         "ISDBT_LAYERB_TIME_INTERLEAVING",
         DTV_ISDBT_LAYERB_TIME_INTERLEAVING
@@ -217,10 +194,7 @@ pub fn build_props_from_dvbv5(entry: &DvbV5Entry) -> Result<Vec<dtv_property>> {
             parse_modulation(s) as u32,
         ));
     }
-    opt_u8!(
-        "ISDBT_LAYERC_SEGMENT_COUNT",
-        DTV_ISDBT_LAYERC_SEGMENT_COUNT
-    );
+    opt_u8!("ISDBT_LAYERC_SEGMENT_COUNT", DTV_ISDBT_LAYERC_SEGMENT_COUNT);
     opt_u8!(
         "ISDBT_LAYERC_TIME_INTERLEAVING",
         DTV_ISDBT_LAYERC_TIME_INTERLEAVING
@@ -241,16 +215,17 @@ pub fn build_props_simple_isdbt(
     bandwidth_hz: u32,
     _service_id: u16,
 ) -> Vec<dtv_property> {
-    let bw = if bandwidth_hz > 0 { bandwidth_hz } else { 6_000_000 };
+    let bw = if bandwidth_hz > 0 {
+        bandwidth_hz
+    } else {
+        6_000_000
+    };
     vec![
         prop_u32(DTV_CLEAR, 0),
         prop_u32(DTV_DELIVERY_SYSTEM, fe_delivery_system::SYS_ISDBT as u32),
         prop_u32(DTV_FREQUENCY, frequency),
         prop_u32(DTV_BANDWIDTH_HZ, bw),
-        prop_u32(
-            DTV_INVERSION,
-            fe_spectral_inversion::INVERSION_AUTO as u32,
-        ),
+        prop_u32(DTV_INVERSION, fe_spectral_inversion::INVERSION_AUTO as u32),
         prop_u32(
             DTV_GUARD_INTERVAL,
             fe_guard_interval::GUARD_INTERVAL_AUTO as u32,
@@ -269,11 +244,7 @@ pub fn tune_frontend(fe: &Frontend, entry: &DvbV5Entry) -> Result<()> {
     Ok(())
 }
 
-pub fn wait_lock(
-    fe: &Frontend,
-    timeout: Duration,
-    poll: Duration,
-) -> Result<()> {
+pub fn wait_lock(fe: &Frontend, timeout: Duration, poll: Duration) -> Result<()> {
     let start = Instant::now();
     loop {
         let mut mask = 0u32;

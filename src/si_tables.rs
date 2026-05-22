@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 
 const PAT_TABLE_ID: u8 = 0x00;
+const PMT_TABLE_ID: u8 = 0x02;
 const SDT_ACTUAL_TABLE_ID: u8 = 0x42;
 
 /// `true` if DVB CRC-32 over `data` equals crc stored in last 4 bytes (big-endian).
@@ -88,6 +89,100 @@ pub fn parse_pat(section: &[u8]) -> Result<Vec<PatProgram>> {
 }
 
 #[derive(Debug, Clone)]
+pub struct PmtStream {
+    pub stream_type: u8,
+    pub pid: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pmt {
+    pub program_number: u16,
+    pub pcr_pid: u16,
+    pub ca_pids: Vec<u16>,
+    pub streams: Vec<PmtStream>,
+}
+
+fn collect_ca_pids(descriptors: &[u8], out: &mut Vec<u16>) {
+    let mut off = 0usize;
+    while off + 2 <= descriptors.len() {
+        let tag = descriptors[off];
+        let len = descriptors[off + 1] as usize;
+        off += 2;
+        if off + len > descriptors.len() {
+            break;
+        }
+        let d = &descriptors[off..off + len];
+        if tag == 0x09 && d.len() >= 4 {
+            let pid = (u16::from(d[2]) & 0x1f) << 8 | u16::from(d[3]);
+            out.push(pid);
+        }
+        off += len;
+    }
+}
+
+pub fn parse_pmt(section: &[u8]) -> Result<Pmt> {
+    if section.len() < 16 {
+        return Err(Error::Si("PMT too short".into()));
+    }
+    if section[0] != PMT_TABLE_ID {
+        return Err(Error::Si("not a PMT section".into()));
+    }
+    if !section_crc_ok(section) {
+        return Err(Error::Si("PMT CRC mismatch".into()));
+    }
+    let tot = section_total_len(
+        <&[u8; 3]>::try_from(&section[..3]).map_err(|_| Error::Si("PMT header".into()))?,
+    )
+    .ok_or_else(|| Error::Si("bad PMT header".into()))?;
+    if section.len() < tot {
+        return Err(Error::Si("incomplete PMT section".into()));
+    }
+
+    let program_number = u16::from(section[3]) << 8 | u16::from(section[4]);
+    let pcr_pid = (u16::from(section[8]) & 0x1f) << 8 | u16::from(section[9]);
+    let program_info_len = ((usize::from(section[10]) & 0x0f) << 8) | usize::from(section[11]);
+    let end = tot.saturating_sub(4);
+    let program_info_start = 12usize;
+    let program_info_end = program_info_start.saturating_add(program_info_len);
+    if program_info_end > end {
+        return Err(Error::Si("bad PMT program info length".into()));
+    }
+
+    let mut ca_pids = Vec::new();
+    collect_ca_pids(&section[program_info_start..program_info_end], &mut ca_pids);
+
+    let mut off = program_info_end;
+    if off > end {
+        return Err(Error::Si("bad PMT program info length".into()));
+    }
+
+    let mut streams = Vec::new();
+    while off + 5 <= end {
+        let stream_type = section[off];
+        let pid = (u16::from(section[off + 1]) & 0x1f) << 8 | u16::from(section[off + 2]);
+        let es_info_len =
+            ((usize::from(section[off + 3]) & 0x0f) << 8) | usize::from(section[off + 4]);
+        let es_info_start = off + 5;
+        let es_info_end = es_info_start.saturating_add(es_info_len);
+        if es_info_end > end {
+            return Err(Error::Si("bad PMT ES info length".into()));
+        }
+        collect_ca_pids(&section[es_info_start..es_info_end], &mut ca_pids);
+        streams.push(PmtStream { stream_type, pid });
+        off = es_info_end;
+    }
+    ca_pids.sort_unstable();
+    ca_pids.dedup();
+
+    Ok(Pmt {
+        program_number,
+        pcr_pid,
+        ca_pids,
+        streams,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub struct SdtService {
     pub service_id: u16,
     pub name: String,
@@ -112,8 +207,7 @@ pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
         return Err(Error::Si("incomplete SDT section".into()));
     }
 
-    let loop_len =
-        ((usize::from(section[11]) & 0x0f) << 8) | usize::from(section[12]);
+    let loop_len = ((usize::from(section[11]) & 0x0f) << 8) | usize::from(section[12]);
     let mut off = 13usize;
     let end_loop = off.saturating_add(loop_len);
     if end_loop + 4 > tot {
