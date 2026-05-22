@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 const BUF: usize = 188 * 512;
 const MAX_EPG_COLLECT_SECS: u64 = 60;
 const SI_PID_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DVR_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "dvbr")]
@@ -294,6 +295,7 @@ fn main() -> dvbr::Result<()> {
                 Box::new(File::create(&output)?)
             };
 
+            let mut last_data = Instant::now();
             loop {
                 let n = match dvr.read(&mut buf) {
                     Ok(n) => n,
@@ -305,9 +307,17 @@ fn main() -> dvbr::Result<()> {
                     }
                 };
                 if n == 0 {
+                    if last_data.elapsed() >= DVR_STALL_TIMEOUT {
+                        return Err(format!(
+                            "DVR delivered no data for {}s; aborting (signal loss or driver hang?)",
+                            DVR_STALL_TIMEOUT.as_secs()
+                        )
+                        .into());
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
+                last_data = Instant::now();
                 out.write_all(&buf[..n])?;
                 let _ = out.flush();
             }
