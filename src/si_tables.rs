@@ -188,7 +188,9 @@ pub struct SdtService {
     pub name: String,
 }
 
-/// Best-effort SDT actual parser (service names via service descriptor `0x48`).
+/// Best-effort SDT actual parser. Service names come from the service
+/// descriptor (`0x48`) and are decoded as ARIB STD-B24 text (same as
+/// EIT event names in `eit.rs`) — not raw UTF-8.
 pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
     if section.len() < 15 {
         return Err(Error::Si("SDT too short".into()));
@@ -245,7 +247,7 @@ pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
                     nstart += 1;
                     if nstart + name_len <= d + dl {
                         let raw = &section[nstart..nstart + name_len];
-                        name = decode_dvb_text(raw);
+                        name = arib_b24::decode(raw);
                     }
                 }
             }
@@ -260,15 +262,73 @@ pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
     Ok(services)
 }
 
-fn decode_dvb_text(raw: &[u8]) -> String {
-    if raw.is_empty() {
-        return String::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a minimal SDT-actual section carrying one service whose
+    // service descriptor (0x48) name is an ARIB STD-B24 byte sequence
+    // (ESC$3B … → ARIB additional symbol 🈑 / U+1F211). The framing
+    // matches this best-effort parser; the CRC is computed in-place.
+    fn sdt_with_arib_name(name_bytes: &[u8]) -> Vec<u8> {
+        // 0x48 descriptor body: service_type, provider_len=0, name_len, name.
+        let mut desc_body = vec![0x01u8, 0x00, name_bytes.len() as u8];
+        desc_body.extend_from_slice(name_bytes);
+        let descriptor = {
+            let mut d = vec![0x48u8, desc_body.len() as u8];
+            d.extend_from_slice(&desc_body);
+            d
+        };
+        // Service entry (parser framing): service_id(2) + desc_loop_len(2).
+        let mut svc = vec![0x04u8, 0xd2]; // service_id = 1234
+        svc.push((descriptor.len() >> 8) as u8 & 0x0f);
+        svc.push(descriptor.len() as u8);
+        svc.extend_from_slice(&descriptor);
+
+        // Section header up to the service-loop-length field at [11..13].
+        let mut sec = vec![
+            SDT_ACTUAL_TABLE_ID, // [0]
+            0x00, 0x00, // [1..3] section_length, filled below
+            0x00, 0x01, // [3..5] transport_stream_id
+            0x01, // [5]  version / current_next
+            0x00, // [6]  section_number
+            0x00, // [7]  last_section_number
+            0x00, 0x00, // [8..10] original_network_id
+            0x00, // [10] reserved
+        ];
+        sec.push((svc.len() >> 8) as u8 & 0x0f); // [11] loop_len hi
+        sec.push(svc.len() as u8); // [12] loop_len lo
+        sec.extend_from_slice(&svc); // [13..] service loop
+
+        // section_length = bytes after [2], including the 4-byte CRC.
+        let section_length = (sec.len() - 3 + 4) as u16;
+        sec[1] = 0xb0 | ((section_length >> 8) as u8 & 0x0f);
+        sec[2] = section_length as u8;
+
+        let crc = crc32_mpeg(&sec);
+        sec.extend_from_slice(&crc.to_be_bytes());
+        sec
     }
-    if raw[0] == 0xfe {
-        return String::from_utf8_lossy(&raw[1..]).into_owned();
+
+    #[test]
+    fn sdt_service_name_is_arib_b24_decoded() {
+        // ESC $ 3B; LS0; GL 0x7A 0x56 → ARIB additional symbol U+1F211 (🈑).
+        // from_utf8_lossy would yield the literal control bytes, not 🈑.
+        let arib = [0x1b, 0x24, 0x3b, 0x0f, 0x7a, 0x56];
+        let section = sdt_with_arib_name(&arib);
+
+        let services = parse_sdt(&section).expect("parse SDT");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service_id, 1234);
+        assert_eq!(
+            services[0].name, "🈑",
+            "service name must be ARIB-B24 decoded (got {:?})",
+            services[0].name
+        );
+        assert_ne!(
+            services[0].name,
+            String::from_utf8_lossy(&arib),
+            "name must not be the raw from_utf8_lossy fallback",
+        );
     }
-    if raw[0] <= 0x1f && raw.len() > 1 {
-        return String::from_utf8_lossy(&raw[1..]).into_owned();
-    }
-    String::from_utf8_lossy(raw).into_owned()
 }
