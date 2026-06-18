@@ -26,7 +26,7 @@ is shared with `isdb-hub`).
 ## Where it fits
 
 `dvbr` is the **frontend** of the stack:
-[`isdb-hub`](https://github.com/DuckFeather10086/isdb-hub) spawns `dvbr tune`
+[`isdb-hub`](https://github.com/DuckFeather10086/isdb-hub) spawns `dvb-rs tune`
 as a subprocess, pipes its TS through
 [`b25`](https://github.com/DuckFeather10086/libaribb25-rs) for
 descrambling, and fans the result out to HLS / recordings. `dvbr epg`
