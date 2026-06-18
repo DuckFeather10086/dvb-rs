@@ -32,7 +32,7 @@ as a subprocess, pipes its TS through
 descrambling, and fans the result out to HLS / recordings. `dvbr epg`
 feeds the EPG store.
 
-It depends on [`arib-b24`](https://github.com/DuckFeather10086/arib-b24-rs)
+It depends on [`arib-b24` (libaribb24-rs)](https://github.com/DuckFeather10086/libaribb24-rs)
 to decode SDT service names and EIT programme text to UTF-8.
 
 ## Build
@@ -46,5 +46,5 @@ Cross-process adapter serialization is an flock on
 the caller already holds the lock.
 
 See the umbrella repo
-[`isdb-workspace`](https://github.com/DuckFeather10086/isdbd) for the
+[`isdb-workspace`](https://github.com/DuckFeather10086/isdb-workspace) for the
 full picture.
