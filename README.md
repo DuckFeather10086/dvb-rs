@@ -21,12 +21,12 @@ Think of it as a focused, scriptable replacement for `dvbv5-zap` /
 | `migrate`   | Migrate a legacy `.conf` to `channels.json` / `channels.toml`. |
 
 Channels are resolved by name / alias from `channels.json` (the format
-is shared with `isdb-hub`).
+is shared with `ferrite`).
 
 ## Where it fits
 
 `dvbr` is the **frontend** of the stack:
-[`isdb-hub`](https://github.com/DuckFeather10086/isdb-hub) spawns `dvb-rs tune`
+[`ferrite`](https://github.com/DuckFeather10086/ferrite) spawns `dvb-rs tune`
 as a subprocess, pipes its TS through
 [`b25`](https://github.com/DuckFeather10086/libaribb25-rs) for
 descrambling, and fans the result out to HLS / recordings. `dvbr epg`
