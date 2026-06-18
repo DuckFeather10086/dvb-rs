@@ -46,5 +46,5 @@ Cross-process adapter serialization is an flock on
 the caller already holds the lock.
 
 See the umbrella repo
-[`isdb-workspace`](https://github.com/DuckFeather10086/isdb-workspace) for the
+[`ferrite`](https://github.com/DuckFeather10086/ferrite) for the
 full picture.
