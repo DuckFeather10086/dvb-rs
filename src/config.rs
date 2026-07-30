@@ -176,6 +176,14 @@ pub fn load_channel_entries(path: &Path) -> Result<Vec<DvbV5Entry>> {
     }
 }
 
+/// Load the full channels.json document, preserving `aliases` /
+/// `legacy_zap_section` / the whole `tuning` map. Use this (rather than
+/// [`load_channel_entries`]) when the document is going to be written back.
+pub fn load_channels_document(path: &Path) -> Result<ChannelsDocument> {
+    let data = fs::read_to_string(path)?;
+    serde_json::from_str(&data).map_err(|e| Error::Parse(e.to_string()))
+}
+
 fn load_channel_entries_json(path: &Path) -> Result<Vec<DvbV5Entry>> {
     let data = fs::read_to_string(path)?;
     let doc: ChannelsDocument =
