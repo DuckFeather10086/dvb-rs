@@ -12,7 +12,7 @@ use dvbr::signal;
 use dvbr::sys::ffi;
 use dvbr::tuner::{tune_frontend, wait_lock};
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -83,6 +83,11 @@ enum Cmd {
         /// alias; only auto-generated placeholders get renamed.
         #[arg(long, default_value_t = false)]
         merge: bool,
+        /// Allow a non-merge write to replace an existing channel list. Without
+        /// this, refusing is the default: the result would hold only the mux
+        /// just scanned.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Show `FE_GET_INFO` name + caps summary
     FeInfo {
@@ -129,6 +134,12 @@ enum Cmd {
         /// Emit events with no title and no synopsis (broadcast placeholders / not filled yet)
         #[arg(long)]
         include_empty: bool,
+        /// Report only the named service. By default the whole mux is
+        /// harvested: EIT on PID 0x0012 describes every service in the
+        /// transport stream, so one tune covers all of a broadcaster's
+        /// subchannels for free. Each event carries its own service_id.
+        #[arg(long)]
+        only_service: bool,
         /// Channel name (alias or dvbr_name in channels.json)
         name: String,
     },
@@ -292,6 +303,7 @@ fn main() -> dvbr::Result<()> {
             output,
             name,
             merge,
+            force,
         } => {
             let _lock = acquire_adapter_lock(adapter)?;
             let (entry, freq, bw) = if let Some(path) = channels {
@@ -340,6 +352,21 @@ fn main() -> dvbr::Result<()> {
                     report.aliased.len()
                 );
             } else {
+                // Without --merge this writes *only* the scanned transport,
+                // so pointing it at a populated channel list replaces every
+                // other mux, plus the curated names and aliases, with one
+                // frequency's worth of bare records. --output defaults to
+                // channels.json, which makes that the easiest mistake in
+                // this CLI to make and the least obvious to notice.
+                if !force && config::load_channels_document(&output).is_ok() {
+                    return Err(dvbr::Error::Msg(format!(
+                        "{} is an existing channel list: `scan` without --merge would \
+                         replace all of it with just this transport. Use --merge to fold \
+                         the scanned names in, -o to write elsewhere, or --force if you \
+                         really mean to overwrite.",
+                        output.display()
+                    )));
+                }
                 config::write_channels_json(&output, &ch)?;
                 info!(
                     "wrote {} channel(s) to {}",
@@ -401,6 +428,7 @@ fn main() -> dvbr::Result<()> {
             collect_secs,
             json,
             include_empty,
+            only_service,
             name,
         } => {
             let _lock = acquire_adapter_lock(adapter)?;
@@ -421,43 +449,50 @@ fn main() -> dvbr::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(secs);
 
             // The Siano USB driver does not support kernel section filter (DMX_SET_FILTER) for
-            // EIT on PID 0x0012. Use a PES tap filter instead: this routes only PID 0x0012 TS
-            // packets to the DVR device, reducing USB bandwidth and packet loss compared to the
-            // full-mux approach, while we reassemble sections in userspace.
-            let dm = Demux::open_rw(adapter, demux)?;
-            unsafe {
-                use dvbr::sys::dmx_abi::{
-                    dmx_apply_pes_filter, dmx_stream_start, DmxPesFilterParams,
-                };
-                let p = DmxPesFilterParams::ts_tap_pid(eit::EIT_PID);
-                dmx_apply_pes_filter(dm.as_raw_fd(), &p)?;
-                dmx_stream_start(dm.as_raw_fd())?;
-            }
+            // EIT on PID 0x0012. Use PES tap filters instead: this routes only the EIT PIDs to
+            // the DVR device, reducing USB bandwidth and packet loss compared to the full-mux
+            // approach, while we reassemble sections in userspace.
+            //
+            // Both EIT PIDs are tapped: 0x0012 carries the guide for the regular services and
+            // 0x0027 the one for partial-reception (ワンセグ / 携帯) ones. They are separate
+            // streams, so tapping only the first left every one-seg service with an empty
+            // schedule.
+            let eit_pids = [eit::EIT_PID, eit::EIT_PID_ONESEG];
+            let _taps = PidTaps::start(adapter, demux, &eit_pids)?;
             let mut dvr = DvrReader::open_ro(adapter, demux)?;
 
             let mut all_sections: Vec<EitSection> = Vec::new();
-            let mut seen: HashMap<(u8, u8), bool> = HashMap::new();
+            let mut seen: HashSet<(u16, u8, u8)> = HashSet::new();
 
+            // Default: harvest the whole mux. EIT carries every service in
+            // this transport stream, so restricting to the named one threw
+            // away the siblings' guide for nothing.
+            let only = if only_service { Some(service_id) } else { None };
             info!(
-                "collecting EIT for {}s (PID 0x0012 PES tap, userspace assembly)...",
-                secs
+                "collecting EIT for {secs}s (PES tap on PID 0x0012 + 0x0027, userspace assembly){}...",
+                if only.is_some() {
+                    format!(", service {service_id} only")
+                } else {
+                    ", all services on this mux".to_string()
+                }
             );
             collect_eit_from_dvr(
                 &mut dvr,
-                service_id,
+                &eit_pids,
+                only,
                 schedule,
                 deadline,
                 &mut all_sections,
                 &mut seen,
             );
-
-            unsafe {
-                let _ = dvbr::sys::dmx_abi::dmx_stream_stop(dm.as_raw_fd());
-            }
+            drop(_taps);
 
             // Gather all events, deduplicate by event_id (keep the richest copy: same id is
             // often sent as TBC placeholder first, then filled in later sections / repetitions).
-            let mut events: HashMap<u16, EitEvent> = HashMap::new();
+            // Keyed by (service, event) — event_id is only unique within a
+            // service, so keying on it alone made services on the same mux
+            // overwrite each other's programmes.
+            let mut events: HashMap<(u16, u16), EitEvent> = HashMap::new();
             for sec in &all_sections {
                 for ev in &sec.events {
                     let score = |e: &EitEvent| {
@@ -466,7 +501,7 @@ fn main() -> dvbr::Result<()> {
                             + e.content_nibbles.len().saturating_mul(8)
                     };
                     events
-                        .entry(ev.event_id)
+                        .entry((sec.service_id, ev.event_id))
                         .and_modify(|existing| {
                             if score(ev) > score(existing) {
                                 *existing = ev.clone();
@@ -475,11 +510,21 @@ fn main() -> dvbr::Result<()> {
                         .or_insert_with(|| ev.clone());
                 }
             }
-            let mut sorted: Vec<EitEvent> = events.into_values().collect();
-            sorted.sort_by(|a, b| a.start.cmp(&b.start));
+            let mut sorted: Vec<(u16, EitEvent)> =
+                events.into_iter().map(|((sid, _), ev)| (sid, ev)).collect();
+            sorted.sort_by(|a, b| a.1.start.cmp(&b.1.start).then(a.0.cmp(&b.0)));
             if !include_empty {
-                sorted.retain(|ev| !ev.title.trim().is_empty() || !ev.text.trim().is_empty());
+                sorted.retain(|(_, ev)| !ev.title.trim().is_empty() || !ev.text.trim().is_empty());
             }
+            info!(
+                "{} events across {} service(s)",
+                sorted.len(),
+                sorted
+                    .iter()
+                    .map(|(sid, _)| *sid)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+            );
 
             if json {
                 print_events_json(&sorted);
@@ -493,15 +538,28 @@ fn main() -> dvbr::Result<()> {
 
 // ── EIT collection ───────────────────────────────────────────────────────────
 
+/// Collect EIT sections from the DVR tap until `deadline`.
+///
+/// `only_service` restricts the harvest to one service_id; `None` (the
+/// default) keeps the whole transport stream, which is what makes one tune
+/// yield the guide for every service on the mux.
 fn collect_eit_from_dvr(
     dvr: &mut DvrReader,
-    service_id: u16,
+    pids: &[u16],
+    only_service: Option<u16>,
     include_schedule: bool,
     deadline: Instant,
     out: &mut Vec<EitSection>,
-    seen: &mut HashMap<(u8, u8), bool>,
+    seen: &mut HashSet<(u16, u8, u8)>,
 ) {
-    let mut asm = TsSectionAssembler::new(eit::EIT_PID);
+    // One assembler per PID: the DVR hands back both taps interleaved, and
+    // continuity counters and partial sections are per PID. A single
+    // assembler fed from two streams would treat the other's packets as
+    // continuity losses and discard half-built sections.
+    let mut asms: Vec<TsSectionAssembler> = pids
+        .iter()
+        .map(|&pid| TsSectionAssembler::new(pid))
+        .collect();
     let mut buf = vec![0u8; eit::TS_PACKET_SIZE * 512];
 
     loop {
@@ -521,20 +579,32 @@ fn collect_eit_from_dvr(
             }
         };
         for pkt in buf[..n].chunks_exact(eit::TS_PACKET_SIZE) {
-            if !asm.feed(pkt) {
-                continue;
-            }
-            for raw in asm.drain() {
-                let table_id = raw[0];
-                let want = table_id == eit::EIT_ACTUAL_PF
-                    || (include_schedule
-                        && (eit::EIT_ACTUAL_SCHED_FIRST..=eit::EIT_ACTUAL_SCHED_LAST)
-                            .contains(&table_id));
-                if !want {
+            // Each assembler ignores packets that aren't its PID, so the
+            // interleaved tap output can just be offered to all of them.
+            for asm in asms.iter_mut() {
+                if !asm.feed(pkt) {
                     continue;
                 }
-                match eit::parse_eit_section(&raw) {
-                    Ok(sec) if sec.service_id == service_id => {
+                for raw in asm.drain() {
+                    let table_id = raw[0];
+                    let want = table_id == eit::EIT_ACTUAL_PF
+                        || (include_schedule
+                            && (eit::EIT_ACTUAL_SCHED_FIRST..=eit::EIT_ACTUAL_SCHED_LAST)
+                                .contains(&table_id));
+                    if !want {
+                        continue;
+                    }
+                    if let Ok(sec) = eit::parse_eit_section(&raw) {
+                        // Keep every service in this transport stream, not
+                        // just the one we tuned for. EIT actual-TS
+                        // (0x4E, 0x50-0x5F) describes *all* services of the
+                        // mux, so one tune is one mux's worth of guide — a
+                        // broadcaster's four services and, via PID 0x0027, its
+                        // one-seg feeds. Filtering to a single service_id here
+                        // was why every sibling channel had an empty schedule.
+                        if only_service.is_some_and(|want| sec.service_id != want) {
+                            continue;
+                        }
                         log::debug!(
                             "EIT table=0x{:02x} svc={} sec={}/{} events={}",
                             sec.table_id,
@@ -543,14 +613,13 @@ fn collect_eit_from_dvr(
                             sec.last_section_number,
                             sec.events.len()
                         );
-                        let key = (sec.table_id, sec.section_number);
-                        if !seen.contains_key(&key) {
-                            seen.insert(key, true);
+                        // Section numbering restarts per (service, table),
+                        // so the dedup key has to carry the service or one
+                        // service's section 3 hides every other's.
+                        if seen.insert((sec.service_id, sec.table_id, sec.section_number)) {
                             out.push(sec);
                         }
                     }
-                    Ok(_) => {}
-                    Err(_) => {}
                 }
             }
         }
@@ -559,8 +628,8 @@ fn collect_eit_from_dvr(
 
 // ── Output formatters ────────────────────────────────────────────────────────
 
-fn print_events_human(events: &[EitEvent]) {
-    for ev in events {
+fn print_events_human(events: &[(u16, EitEvent)]) {
+    for (service_id, ev) in events {
         let start = ev
             .start
             .as_ref()
@@ -584,7 +653,7 @@ fn print_events_human(events: &[EitEvent]) {
             .map(|&(l1, l2)| eit::content_genre(l1, l2))
             .unwrap_or("");
         println!(
-            "  [{:5}]{running}  {start}  +{dur}  {}{}",
+            "  svc {service_id} [{:5}]{running}  {start}  +{dur}  {}{}",
             ev.event_id,
             ev.title,
             if genre.is_empty() {
@@ -601,9 +670,12 @@ fn print_events_human(events: &[EitEvent]) {
     }
 }
 
-fn print_events_json(events: &[EitEvent]) {
+/// Each event carries its own `service_id`: the harvest spans every service
+/// on the mux, so the consumer must not assume they all belong to the
+/// channel that was named on the command line.
+fn print_events_json(events: &[(u16, EitEvent)]) {
     print!("[");
-    for (i, ev) in events.iter().enumerate() {
+    for (i, (service_id, ev)) in events.iter().enumerate() {
         if i > 0 {
             print!(",");
         }
@@ -621,9 +693,9 @@ fn print_events_json(events: &[EitEvent]) {
             .map(|&(l1, l2)| format!("\"{}\"", eit::content_genre(l1, l2)))
             .collect();
         print!(
-            "{{\"event_id\":{},\"start\":\"{start}\",\"duration\":\"{dur}\",\
-             \"running_status\":{},\"title\":\"{title}\",\"text\":\"{text}\",\
-             \"genres\":[{}]}}",
+            "{{\"service_id\":{service_id},\"event_id\":{},\"start\":\"{start}\",\
+             \"duration\":\"{dur}\",\"running_status\":{},\"title\":\"{title}\",\
+             \"text\":\"{text}\",\"genres\":[{}]}}",
             ev.event_id,
             ev.running_status,
             genres.join(",")

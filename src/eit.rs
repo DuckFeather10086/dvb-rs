@@ -6,6 +6,14 @@ use crate::si_tables::section_crc_ok;
 
 pub const EIT_PID: u16 = 0x0012;
 
+/// EIT for partial reception (one-seg / 携帯) services.
+///
+/// ISDB-T carries their guide on its own PID — ARIB STD-B10 Part 2 splits
+/// the "H-EIT" on 0x0012 from the "L-EIT" on 0x0027 — with the same table
+/// ids and the same section layout. Tapping only 0x0012 leaves every
+/// ワンセグ / 携帯 service with an empty schedule.
+pub const EIT_PID_ONESEG: u16 = 0x0027;
+
 /// EIT table_id values.
 pub const EIT_ACTUAL_PF: u8 = 0x4e; // present/following, this TS
 pub const EIT_OTHER_PF: u8 = 0x4f; // present/following, other TS
