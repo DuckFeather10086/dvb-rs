@@ -61,8 +61,25 @@ pub fn merge_scanned_names(
 ) -> MergeReport {
     let mut report = MergeReport::default();
 
-    // Names already in use, so a replacement can't collide with one.
-    let mut taken: Vec<String> = doc.channels.iter().map(|c| c.name.clone()).collect();
+    // Every string that already selects some record — names *and* aliases.
+    //
+    // Aliases have to count. Lookup (`Channels::find` / config::find_entry)
+    // walks records in order and checks each one's name and aliases together,
+    // so the first record wins. Handing a placeholder a name that is already
+    // an alias of an earlier record produces a record that cannot be selected
+    // by its own name: the earlier record answers instead. That happened for
+    // real — service 1065 was renamed "テレビ朝日", which was already an
+    // alias of `asahi` (1064), so 1065 became unreachable and its guide came
+    // back empty while tuning it went to 1064.
+    let mut taken: Vec<String> = doc
+        .channels
+        .iter()
+        .flat_map(|c| {
+            std::iter::once(c.name.clone())
+                .chain(c.aliases.iter().cloned())
+                .chain(c.legacy_zap_section.clone())
+        })
+        .collect();
 
     for svc in &scanned.channels {
         if svc.name.is_empty() || is_placeholder_name(&svc.name) {
@@ -91,6 +108,7 @@ pub fn merge_scanned_names(
             }
             report.renamed.push((rec.name.clone(), candidate.clone()));
             taken.push(candidate.clone());
+            taken.push(rec.name.clone());
             // The old placeholder stays reachable as an alias.
             if !rec.aliases.contains(&rec.name) {
                 rec.aliases.push(rec.name.clone());
@@ -314,6 +332,51 @@ mod tests {
             .aliases
             .contains(&"u1065_539142857".to_string()));
         assert_eq!(report.renamed.len(), 2);
+    }
+
+    // Regression: a placeholder must not be handed a name that is already an
+    // ALIAS of an earlier record. Lookup checks each record's name and
+    // aliases together in file order, so the earlier record would answer and
+    // this one would be unreachable by its own name.
+    #[test]
+    fn rename_does_not_shadow_an_earlier_records_alias() {
+        let mut doc = ChannelsDocument {
+            version: 1,
+            channels: vec![
+                rec("asahi", 1064, 539142857, &["テレビ朝日"]),
+                rec("u1065_539142857", 1065, 539142857, &[]),
+                rec("u1066_539142857", 1066, 539142857, &[]),
+            ],
+        };
+        merge_scanned_names(
+            &mut doc,
+            &scanned(&[
+                ("テレビ朝日", 1065, 539142857),
+                ("テレビ朝日", 1066, 539142857),
+            ]),
+        );
+
+        assert_eq!(doc.channels[0].name, "asahi");
+        assert_eq!(
+            doc.channels[1].name, "テレビ朝日_2",
+            "the plain name already resolves to asahi, so 1065 must be suffixed"
+        );
+        assert_eq!(doc.channels[2].name, "テレビ朝日_3");
+
+        // Every record must be selectable by its own name, first-match wins.
+        for r in &doc.channels {
+            let first = doc
+                .channels
+                .iter()
+                .find(|c| c.name == r.name || c.aliases.contains(&r.name))
+                .unwrap();
+            assert_eq!(
+                first.tuning.get("SERVICE_ID"),
+                r.tuning.get("SERVICE_ID"),
+                "{} resolves to a different service",
+                r.name
+            );
+        }
     }
 
     #[test]
