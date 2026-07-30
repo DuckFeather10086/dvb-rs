@@ -6,6 +6,7 @@ use dvbr::eit::TsSectionAssembler;
 use dvbr::eit::{self, EitEvent, EitSection};
 use dvbr::frontend::Frontend;
 use dvbr::scan;
+use dvbr::si_reader;
 use dvbr::si_tables::{parse_pat, parse_pmt};
 use dvbr::signal;
 use dvbr::sys::ffi;
@@ -76,6 +77,12 @@ enum Cmd {
         /// If `--channels` is set: lookup name (`DVBR_NAME`, alias, or `[section]`)
         #[arg(long)]
         name: Option<String>,
+        /// Fold the scanned service names into an existing channels.json at
+        /// `--output` instead of overwriting it with just this transport.
+        /// Additive: curated names are kept and gain the broadcast name as an
+        /// alias; only auto-generated placeholders get renamed.
+        #[arg(long, default_value_t = false)]
+        merge: bool,
     },
     /// Show `FE_GET_INFO` name + caps summary
     FeInfo {
@@ -157,55 +164,8 @@ fn acquire_adapter_lock(adapter: u32) -> dvbr::Result<Option<AdapterLock>> {
     }
 }
 
-fn read_section_from_pid_tap(
-    adapter: u32,
-    demux: u32,
-    pid: u16,
-    table_id: u8,
-    timeout: Duration,
-) -> dvbr::Result<Vec<u8>> {
-    let dm = Demux::open_rw(adapter, demux)?;
-    dm.tap_pid_to_dvr(pid)?;
-    let mut dvr = DvrReader::open_ro_nonblocking(adapter, demux)?;
-    let mut asm = TsSectionAssembler::new(pid);
-    let mut buf = vec![0u8; eit::TS_PACKET_SIZE * 64];
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        let n = match dvr.read(&mut buf) {
-            Ok(n) if n > 0 => n,
-            Ok(_) => {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        };
-
-        for pkt in buf[..n].chunks_exact(eit::TS_PACKET_SIZE) {
-            if !asm.feed(pkt) {
-                continue;
-            }
-            for section in asm.drain() {
-                if section.first().copied() == Some(table_id) {
-                    drop(dm);
-                    return Ok(section);
-                }
-            }
-        }
-    }
-
-    Err(dvbr::Error::Si(format!(
-        "timed out reading table 0x{table_id:02x} from PID 0x{pid:04x}"
-    )))
-}
-
 fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvbr::Result<Vec<u16>> {
-    let pat_section = read_section_from_pid_tap(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
+    let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
     let pat = parse_pat(&pat_section)?;
     let pmt_pid = pat
         .iter()
@@ -213,8 +173,7 @@ fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvbr:
         .map(|program| program.pid)
         .ok_or_else(|| dvbr::Error::Si(format!("service_id {service_id} not found in PAT")))?;
 
-    let pmt_section =
-        read_section_from_pid_tap(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
+    let pmt_section = si_reader::read_section(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
     let pmt = parse_pmt(&pmt_section)?;
     let mut pids = vec![0x0000, pmt_pid];
     if pmt.pcr_pid != 0x1fff {
@@ -332,6 +291,7 @@ fn main() -> dvbr::Result<()> {
             delivery,
             output,
             name,
+            merge,
         } => {
             let _lock = acquire_adapter_lock(adapter)?;
             let (entry, freq, bw) = if let Some(path) = channels {
@@ -356,12 +316,37 @@ fn main() -> dvbr::Result<()> {
                 if bw > 0 { bw } else { 6_000_000 },
                 entry_ref,
             )?;
-            config::write_channels_json(&output, &ch)?;
-            info!(
-                "wrote {} channel(s) to {}",
-                ch.channels.len(),
-                output.display()
-            );
+            if merge {
+                let mut doc = config::load_channels_document(&output)?;
+                let report = scan::merge_scanned_names(&mut doc, &ch);
+                config::write_channels_document_json(&output, &doc)?;
+                for (from, to) in &report.renamed {
+                    info!("renamed {from} -> {to}");
+                }
+                for name in &report.aliased {
+                    info!("added broadcast name as alias on {name}");
+                }
+                if !report.unmatched.is_empty() {
+                    info!(
+                        "scanned service(s) with no matching record: {:?}",
+                        report.unmatched
+                    );
+                }
+                info!(
+                    "merged {} scanned service(s) into {} ({} renamed, {} aliased)",
+                    ch.channels.len(),
+                    output.display(),
+                    report.renamed.len(),
+                    report.aliased.len()
+                );
+            } else {
+                config::write_channels_json(&output, &ch)?;
+                info!(
+                    "wrote {} channel(s) to {}",
+                    ch.channels.len(),
+                    output.display()
+                );
+            }
         }
         Cmd::FeInfo { adapter, frontend } => {
             let fe = Frontend::open_rw(adapter, frontend)?;
