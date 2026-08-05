@@ -209,19 +209,29 @@ pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
         return Err(Error::Si("incomplete SDT section".into()));
     }
 
-    let loop_len = ((usize::from(section[11]) & 0x0f) << 8) | usize::from(section[12]);
-    let mut off = 13usize;
-    let end_loop = off.saturating_add(loop_len);
-    if end_loop + 4 > tot {
-        return Err(Error::Si("bad SDT service loop length".into()));
-    }
+    // SDT has no service-loop-length field (unlike PMT's program_info_length):
+    // the loop starts right after the fixed header at byte 11 and runs to the
+    // end of the section, less the 4-byte CRC.
+    //
+    //   [0]      table_id
+    //   [1..3]   syntax/section_length
+    //   [3..5]   transport_stream_id
+    //   [5]      version / current_next
+    //   [6]      section_number
+    //   [7]      last_section_number
+    //   [8..10]  original_network_id
+    //   [10]     reserved_future_use
+    //   [11..]   service loop
+    let mut off = 11usize;
+    let end_loop = tot - 4;
 
     let mut services = Vec::new();
-    while off + 4 <= end_loop {
+    // Each entry: service_id(2) + EIT flags(1) + running/CA/desc_len(2) = 5.
+    while off + 5 <= end_loop {
         let sid = u16::from(section[off]) << 8 | u16::from(section[off + 1]);
         let dlen =
-            ((u16::from(section[off + 2]) << 8 | u16::from(section[off + 3])) & 0x0fff) as usize;
-        off += 4;
+            ((u16::from(section[off + 3]) << 8 | u16::from(section[off + 4])) & 0x0fff) as usize;
+        off += 5;
         let desc_end = off.saturating_add(dlen);
         if desc_end > end_loop {
             break;
@@ -266,11 +276,9 @@ pub fn parse_sdt(section: &[u8]) -> Result<Vec<SdtService>> {
 mod tests {
     use super::*;
 
-    // Build a minimal SDT-actual section carrying one service whose
-    // service descriptor (0x48) name is an ARIB STD-B24 byte sequence
-    // (ESC$3B … → ARIB additional symbol 🈑 / U+1F211). The framing
-    // matches this best-effort parser; the CRC is computed in-place.
-    fn sdt_with_arib_name(name_bytes: &[u8]) -> Vec<u8> {
+    /// One service-loop entry, framed per EN 300 468 §5.2.3:
+    /// service_id(2), EIT flags(1), running_status/free_CA/desc_len(2).
+    fn sdt_service_entry(service_id: u16, name_bytes: &[u8]) -> Vec<u8> {
         // 0x48 descriptor body: service_type, provider_len=0, name_len, name.
         let mut desc_body = vec![0x01u8, 0x00, name_bytes.len() as u8];
         desc_body.extend_from_slice(name_bytes);
@@ -279,26 +287,35 @@ mod tests {
             d.extend_from_slice(&desc_body);
             d
         };
-        // Service entry (parser framing): service_id(2) + desc_loop_len(2).
-        let mut svc = vec![0x04u8, 0xd2]; // service_id = 1234
-        svc.push((descriptor.len() >> 8) as u8 & 0x0f);
+        let mut svc = service_id.to_be_bytes().to_vec();
+        svc.push(0x00); // reserved(6) + EIT_schedule + EIT_present_following
+                        // running_status(3) | free_CA(1) | descriptors_loop_length(12)
+        svc.push(0x80 | ((descriptor.len() >> 8) as u8 & 0x0f));
         svc.push(descriptor.len() as u8);
         svc.extend_from_slice(&descriptor);
+        svc
+    }
 
-        // Section header up to the service-loop-length field at [11..13].
+    // Build a real-layout SDT-actual section from pre-framed service
+    // entries: fixed 11-byte header, then the service loop straight to the
+    // CRC — SDT has no loop-length field. The CRC is computed in-place.
+    fn sdt_section(entries: &[Vec<u8>]) -> Vec<u8> {
         let mut sec = vec![
             SDT_ACTUAL_TABLE_ID, // [0]
-            0x00, 0x00, // [1..3] section_length, filled below
-            0x00, 0x01, // [3..5] transport_stream_id
+            0x00,
+            0x00, // [1..3] section_length, filled below
+            0x00,
+            0x01, // [3..5] transport_stream_id
             0x01, // [5]  version / current_next
             0x00, // [6]  section_number
             0x00, // [7]  last_section_number
-            0x00, 0x00, // [8..10] original_network_id
-            0x00, // [10] reserved
+            0x00,
+            0x00, // [8..10] original_network_id
+            0x00, // [10] reserved_future_use
         ];
-        sec.push((svc.len() >> 8) as u8 & 0x0f); // [11] loop_len hi
-        sec.push(svc.len() as u8); // [12] loop_len lo
-        sec.extend_from_slice(&svc); // [13..] service loop
+        for e in entries {
+            sec.extend_from_slice(e); // [11..] service loop
+        }
 
         // section_length = bytes after [2], including the 4-byte CRC.
         let section_length = (sec.len() - 3 + 4) as u16;
@@ -315,7 +332,7 @@ mod tests {
         // ESC $ 3B; LS0; GL 0x7A 0x56 → ARIB additional symbol U+1F211 (🈑).
         // from_utf8_lossy would yield the literal control bytes, not 🈑.
         let arib = [0x1b, 0x24, 0x3b, 0x0f, 0x7a, 0x56];
-        let section = sdt_with_arib_name(&arib);
+        let section = sdt_section(&[sdt_service_entry(1234, &arib)]);
 
         let services = parse_sdt(&section).expect("parse SDT");
         assert_eq!(services.len(), 1);
@@ -330,5 +347,46 @@ mod tests {
             String::from_utf8_lossy(&arib),
             "name must not be the raw from_utf8_lossy fallback",
         );
+    }
+
+    // Regression: the loop framing used to be read as PMT-style
+    // (a 12-bit loop length at [11..13], 4-byte service entries). Real SDT
+    // has neither — the loop starts at [11] and each entry header is 5
+    // bytes. With the old framing a real broadcast SDT failed outright
+    // ("bad SDT service loop length"), so every channel fell back to a
+    // `program_<n>` placeholder name.
+    #[test]
+    fn sdt_parses_every_service_in_the_loop() {
+        let arib = [0x1b, 0x24, 0x3b, 0x0f, 0x7a, 0x56];
+        let section = sdt_section(&[
+            sdt_service_entry(1064, &arib),
+            sdt_service_entry(1065, &[]), // present, but unnamed
+            sdt_service_entry(1448, &arib),
+        ]);
+
+        let services = parse_sdt(&section).expect("parse SDT");
+        let ids: Vec<u16> = services.iter().map(|s| s.service_id).collect();
+        assert_eq!(
+            ids,
+            vec![1064, 1065, 1448],
+            "every service in the loop must be reported, in order"
+        );
+        assert_eq!(services[0].name, "🈑");
+        assert_eq!(services[1].name, "", "unnamed service yields an empty name");
+        assert_eq!(services[2].name, "🈑");
+    }
+
+    // A section whose final entry is cut short must yield the entries that
+    // are intact rather than erroring the whole table away.
+    #[test]
+    fn sdt_tolerates_a_truncated_trailing_entry() {
+        let arib = [0x1b, 0x24, 0x3b, 0x0f, 0x7a, 0x56];
+        let mut good = sdt_service_entry(1064, &arib);
+        good.extend_from_slice(&[0x04, 0x29, 0x00]); // 3 bytes of a 5-byte header
+        let section = sdt_section(&[good]);
+
+        let services = parse_sdt(&section).expect("parse SDT");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service_id, 1064);
     }
 }
