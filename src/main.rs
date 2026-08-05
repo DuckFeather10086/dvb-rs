@@ -1,16 +1,16 @@
 use clap::{Parser, Subcommand};
-use dvbr::channel::ChannelsFile;
-use dvbr::config;
-use dvbr::demux::{Demux, DvrReader, PidTaps};
-use dvbr::eit::TsSectionAssembler;
-use dvbr::eit::{self, EitEvent, EitSection};
-use dvbr::frontend::Frontend;
-use dvbr::scan;
-use dvbr::si_reader;
-use dvbr::si_tables::{parse_pat, parse_pmt};
-use dvbr::signal;
-use dvbr::sys::ffi;
-use dvbr::tuner::{tune_frontend, wait_lock};
+use dvb_rs::channel::ChannelsFile;
+use dvb_rs::config;
+use dvb_rs::demux::{Demux, DvrReader, PidTaps};
+use dvb_rs::eit::TsSectionAssembler;
+use dvb_rs::eit::{self, EitEvent, EitSection};
+use dvb_rs::frontend::Frontend;
+use dvb_rs::scan;
+use dvb_rs::si_reader;
+use dvb_rs::si_tables::{parse_pat, parse_pmt};
+use dvb_rs::signal;
+use dvb_rs::sys::ffi;
+use dvb_rs::tuner::{tune_frontend, wait_lock};
 use log::{info, warn};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
@@ -26,7 +26,7 @@ const SI_PID_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const DVR_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(name = "dvbr")]
+#[command(name = "dvb-rs")]
 #[command(about = "Rust DVBv5-style tune/scan (Linux DVB API v5)", version)]
 struct Cli {
     #[command(subcommand)]
@@ -149,7 +149,7 @@ struct AdapterLock {
     _file: File,
 }
 
-fn acquire_adapter_lock(adapter: u32) -> dvbr::Result<Option<AdapterLock>> {
+fn acquire_adapter_lock(adapter: u32) -> dvb_rs::Result<Option<AdapterLock>> {
     if std::env::var_os("DVBR_SKIP_ADAPTER_LOCK").is_some() {
         return Ok(None);
     }
@@ -167,7 +167,7 @@ fn acquire_adapter_lock(adapter: u32) -> dvbr::Result<Option<AdapterLock>> {
 
     let err = io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
-        Err(dvbr::Error::Msg(format!(
+        Err(dvb_rs::Error::Msg(format!(
             "DVB adapter {adapter} is already in use (lock: {path})"
         )))
     } else {
@@ -175,14 +175,14 @@ fn acquire_adapter_lock(adapter: u32) -> dvbr::Result<Option<AdapterLock>> {
     }
 }
 
-fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvbr::Result<Vec<u16>> {
+fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvb_rs::Result<Vec<u16>> {
     let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
     let pat = parse_pat(&pat_section)?;
     let pmt_pid = pat
         .iter()
         .find(|program| program.program_number == service_id)
         .map(|program| program.pid)
-        .ok_or_else(|| dvbr::Error::Si(format!("service_id {service_id} not found in PAT")))?;
+        .ok_or_else(|| dvb_rs::Error::Si(format!("service_id {service_id} not found in PAT")))?;
 
     let pmt_section = si_reader::read_section(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
     let pmt = parse_pmt(&pmt_section)?;
@@ -199,10 +199,10 @@ fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvbr:
     Ok(pids)
 }
 
-fn bounded_epg_collect_secs(schedule: bool, collect_secs: Option<u64>) -> dvbr::Result<u64> {
+fn bounded_epg_collect_secs(schedule: bool, collect_secs: Option<u64>) -> dvb_rs::Result<u64> {
     let secs = collect_secs.unwrap_or(if schedule { 60 } else { 15 });
     if secs == 0 {
-        return Err(dvbr::Error::Msg("--collect-secs must be at least 1".into()));
+        return Err(dvb_rs::Error::Msg("--collect-secs must be at least 1".into()));
     }
     if secs > MAX_EPG_COLLECT_SECS {
         warn!("capping EPG collection to {MAX_EPG_COLLECT_SECS}s (requested {secs}s)");
@@ -211,7 +211,7 @@ fn bounded_epg_collect_secs(schedule: bool, collect_secs: Option<u64>) -> dvbr::
     Ok(secs)
 }
 
-fn main() -> dvbr::Result<()> {
+fn main() -> dvb_rs::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
 
@@ -309,12 +309,12 @@ fn main() -> dvbr::Result<()> {
             let (entry, freq, bw) = if let Some(path) = channels {
                 let entries = config::load_channel_entries(&path)?;
                 let n =
-                    name.ok_or_else(|| dvbr::Error::Msg("--name required with --channels".into()))?;
+                    name.ok_or_else(|| dvb_rs::Error::Msg("--name required with --channels".into()))?;
                 let e = config::find_entry(&entries, &n)?;
                 (Some(e.clone()), e.channel.frequency, e.channel.bandwidth_hz)
             } else {
                 let f = frequency.ok_or_else(|| {
-                    dvbr::Error::Msg("either --channels + --name or --frequency is required".into())
+                    dvb_rs::Error::Msg("either --channels + --name or --frequency is required".into())
                 })?;
                 (None, f, bandwidth_hz)
             };
@@ -359,7 +359,7 @@ fn main() -> dvbr::Result<()> {
                 // channels.json, which makes that the easiest mistake in
                 // this CLI to make and the least obvious to notice.
                 if !force && config::load_channels_document(&output).is_ok() {
-                    return Err(dvbr::Error::Msg(format!(
+                    return Err(dvb_rs::Error::Msg(format!(
                         "{} is an existing channel list: `scan` without --merge would \
                          replace all of it with just this transport. Use --merge to fold \
                          the scanned names in, -o to write elsewhere, or --force if you \
@@ -411,7 +411,7 @@ fn main() -> dvbr::Result<()> {
                 == "toml"
             {
                 let s =
-                    toml::to_string_pretty(&doc).map_err(|e| dvbr::Error::Parse(e.to_string()))?;
+                    toml::to_string_pretty(&doc).map_err(|e| dvb_rs::Error::Parse(e.to_string()))?;
                 std::fs::write(&output, s)?;
             } else {
                 config::write_channels_document_json(&output, &doc)?;
