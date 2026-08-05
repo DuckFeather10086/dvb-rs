@@ -1,11 +1,11 @@
 [package]
-name = "dvbr"
+name = "dvb-rs"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 nix = { version = "0.29", features = ["ioctl", "poll", "fs"] }
-arib-b24 = { path = "../arib-b24-rs" }
+arib-b24 = { path = "../libaribb24-rs" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
