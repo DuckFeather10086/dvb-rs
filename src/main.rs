@@ -83,6 +83,13 @@ enum Cmd {
         /// alias; only auto-generated placeholders get renamed.
         #[arg(long, default_value_t = false)]
         merge: bool,
+        /// With `--merge`: also create a record for each scanned service the
+        /// document does not have. This is what builds a channel list from
+        /// nothing — sweep the band and merge each transport that locks —
+        /// where a plain `--merge` only folds names into records that already
+        /// exist. Services the SDT did not name are never added.
+        #[arg(long, default_value_t = false)]
+        add_new: bool,
         /// Allow a non-merge write to replace an existing channel list. Without
         /// this, refusing is the default: the result would hold only the mux
         /// just scanned.
@@ -303,6 +310,7 @@ fn main() -> dvb_rs::Result<()> {
             output,
             name,
             merge,
+            add_new,
             force,
         } => {
             let _lock = acquire_adapter_lock(adapter)?;
@@ -330,7 +338,7 @@ fn main() -> dvb_rs::Result<()> {
             )?;
             if merge {
                 let mut doc = config::load_channels_document(&output)?;
-                let report = scan::merge_scanned_names(&mut doc, &ch);
+                let report = scan::merge_scanned(&mut doc, &ch, add_new);
                 config::write_channels_document_json(&output, &doc)?;
                 for (from, to) in &report.renamed {
                     info!("renamed {from} -> {to}");
@@ -338,16 +346,36 @@ fn main() -> dvb_rs::Result<()> {
                 for name in &report.aliased {
                     info!("added broadcast name as alias on {name}");
                 }
-                if !report.unmatched.is_empty() {
+                for name in &report.added {
+                    info!("added {name}");
+                }
+                if !report.added.is_empty() {
+                    // Nothing else prints the record count, and after a
+                    // band sweep it is the number you actually want.
+                    info!("{} record(s) in {}", doc.channels.len(), output.display());
+                }
+                if !add_new && !report.unmatched.is_empty() {
                     info!(
-                        "scanned service(s) with no matching record: {:?}",
+                        "scanned service(s) with no matching record: {:?} \
+                         (--add-new would create them)",
                         report.unmatched
                     );
                 }
+                if !report.nameless.is_empty() {
+                    // PAT program numbers: the SDT could not be read, so
+                    // there is no name and no way to tell a service from a
+                    // data carousel. Never added; say so rather than
+                    // reporting a mux as empty.
+                    info!(
+                        "service(s) the SDT did not name, skipped: {:?}",
+                        report.nameless
+                    );
+                }
                 info!(
-                    "merged {} scanned service(s) into {} ({} renamed, {} aliased)",
+                    "merged {} scanned service(s) into {} ({} added, {} renamed, {} aliased)",
                     ch.channels.len(),
                     output.display(),
+                    report.added.len(),
                     report.renamed.len(),
                     report.aliased.len()
                 );
