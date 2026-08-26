@@ -47,12 +47,51 @@ fn channels_doc_version() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelRecord {
     pub name: String,
-    #[serde(default)]
+    /// Omitted when empty, like `legacy_zap_section` below. `#[serde(default)]`
+    /// reads an absent one back as empty, so this loses nothing and keeps a
+    /// rewritten list from growing an `"aliases": []` on the two records in
+    /// three that have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
     /// Original `[section]` title for `dvbv5-zap --channels legacy.conf` workflows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_zap_section: Option<String>,
+    #[serde(serialize_with = "serialize_tuning_sorted")]
     pub tuning: HashMap<String, String>,
+}
+
+/// Write a tuning map with its keys in order.
+///
+/// `channels.json` is a file a human curates and a `scan --merge` writes back,
+/// and the documented way to audit a rescan is to scan to a scratch path and
+/// diff it against the real one. A `HashMap` serializes in iteration order,
+/// which `RandomState` seeds per *process* — so this was never a stable file:
+/// three writes of one unmodified document produced three different files,
+/// 1744 lines apart, and the diff that was supposed to show what a rescan
+/// changed showed the whole document every time.
+///
+/// Sorting here rather than switching the field to a `BTreeMap` keeps the
+/// change to serialization: `tuning` is handed straight to
+/// `Channel::from_named_tuning` and lands in `DvbV5Entry::raw`, which is the
+/// path that talks to the frontend, and nothing there wants a new type for a
+/// cosmetic reason. The order is not meaningful to any reader — these are
+/// DVBv5 `KEY = VAL` pairs — so alphabetical is as good as it gets and it is
+/// the one order two processes can agree on.
+fn serialize_tuning_sorted<S>(
+    tuning: &HashMap<String, String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut pairs: Vec<(&String, &String)> = tuning.iter().collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut map = serializer.serialize_map(Some(pairs.len()))?;
+    for (key, value) in pairs {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
 }
 
 /// Load [`ChannelsFile`] from JSON (minimal scan-style list, no `tuning` envelope).
@@ -341,5 +380,60 @@ pub fn document_from_conf_entries(entries: Vec<DvbV5Entry>) -> ChannelsDocument 
     ChannelsDocument {
         version: 1,
         channels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A written channel list has to be byte-stable, because the documented way
+    /// to audit a rescan is to scan to a scratch path and diff. It was not: a
+    /// `HashMap`'s iteration order is seeded per process, so two runs wrote the
+    /// same document differently and the diff showed everything.
+    ///
+    /// This cannot be caught by serializing twice in one process — one map
+    /// iterates the same way every time within it — so the assertion is on the
+    /// property that makes two processes agree: keys ascending.
+    #[test]
+    fn tuning_keys_are_written_in_order() {
+        const KEYS: [&str; 8] = [
+            "TRANSMISSION_MODE",
+            "FREQUENCY",
+            "SERVICE_ID",
+            "BANDWIDTH_HZ",
+            "DELIVERY_SYSTEM",
+            "GUARD_INTERVAL",
+            "INVERSION",
+            "COUNTRY",
+        ];
+        let mut tuning = HashMap::new();
+        for key in KEYS {
+            tuning.insert(key.to_string(), "x".to_string());
+        }
+        let doc = ChannelsDocument {
+            version: 1,
+            channels: vec![ChannelRecord {
+                name: "ch".to_string(),
+                aliases: vec![],
+                legacy_zap_section: None,
+                tuning,
+            }],
+        };
+        let json = serde_json::to_string(&doc).expect("serialize");
+
+        // Each alphabetically-next key has to appear later in the text than the
+        // one before it. Asserting on `serde_json::Value` would prove nothing:
+        // its map sorts on the way in.
+        let mut sorted = KEYS;
+        sorted.sort_unstable();
+        let mut previous = 0usize;
+        for key in sorted {
+            let at = json
+                .find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} missing from {json}"));
+            assert!(at > previous, "{key} is out of order in {json}");
+            previous = at;
+        }
     }
 }
