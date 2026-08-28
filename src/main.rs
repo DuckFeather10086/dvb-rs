@@ -4,10 +4,12 @@ use dvb_rs::config;
 use dvb_rs::demux::{Demux, DvrReader, PidTaps};
 use dvb_rs::eit::TsSectionAssembler;
 use dvb_rs::eit::{self, EitEvent, EitSection};
+use dvb_rs::error::Error;
 use dvb_rs::frontend::Frontend;
+use dvb_rs::px4;
 use dvb_rs::scan;
 use dvb_rs::si_reader;
-use dvb_rs::si_tables::{parse_pat, parse_pmt};
+use dvb_rs::si_tables::{parse_pat, parse_pmt, PatProgram, Pmt};
 use dvb_rs::signal;
 use dvb_rs::sys::ffi;
 use dvb_rs::tuner::{tune_frontend, wait_lock};
@@ -15,7 +17,7 @@ use log::{info, warn};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -43,6 +45,8 @@ enum Cmd {
         frontend: u32,
         #[arg(short = 'd', long, default_value_t = 0)]
         demux: u32,
+        #[arg(long, default_value = "dvb")]
+        backend: String,
         #[arg(short = 'c', long)]
         channels: PathBuf,
         #[arg(short = 'o', long, default_value = "-")]
@@ -63,6 +67,8 @@ enum Cmd {
         frontend: u32,
         #[arg(short = 'd', long, default_value_t = 0)]
         demux: u32,
+        #[arg(long, default_value = "dvb")]
+        backend: String,
         #[arg(short = 'c', long)]
         channels: Option<PathBuf>,
         /// For simple scan without `.conf`: frequency (Hz)
@@ -102,6 +108,8 @@ enum Cmd {
         adapter: u32,
         #[arg(short = 'f', long, default_value_t = 0)]
         frontend: u32,
+        #[arg(long, default_value = "dvb")]
+        backend: String,
     },
     /// Dump legacy `.conf` to UTF-8 JSON channel list
     ConvertConf {
@@ -125,6 +133,8 @@ enum Cmd {
         frontend: u32,
         #[arg(short = 'd', long, default_value_t = 0)]
         demux: u32,
+        #[arg(long, default_value = "dvb")]
+        backend: String,
         #[arg(short = 'c', long)]
         channels: PathBuf,
         #[arg(long, default_value_t = 15000)]
@@ -156,6 +166,17 @@ struct AdapterLock {
     _file: File,
 }
 
+/// True when `--backend` names the px4 chardev backend.
+fn backend_is_px4(s: &str) -> dvb_rs::Result<bool> {
+    match s {
+        "dvb" => Ok(false),
+        "px4" => Ok(true),
+        other => Err(Error::Msg(format!(
+            "unknown backend {other:?} (dvb|px4)"
+        ))),
+    }
+}
+
 fn acquire_adapter_lock(adapter: u32) -> dvb_rs::Result<Option<AdapterLock>> {
     if std::env::var_os("DVBR_SKIP_ADAPTER_LOCK").is_some() {
         return Ok(None);
@@ -182,28 +203,114 @@ fn acquire_adapter_lock(adapter: u32) -> dvb_rs::Result<Option<AdapterLock>> {
     }
 }
 
-fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvb_rs::Result<Vec<u16>> {
-    let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
-    let pat = parse_pat(&pat_section)?;
-    let pmt_pid = pat
-        .iter()
+fn find_pmt_pid(pat: &[PatProgram], service_id: u16) -> dvb_rs::Result<u16> {
+    pat.iter()
         .find(|program| program.program_number == service_id)
         .map(|program| program.pid)
-        .ok_or_else(|| dvb_rs::Error::Si(format!("service_id {service_id} not found in PAT")))?;
+        .ok_or_else(|| Error::Si(format!("service_id {service_id} not found in PAT")))
+}
 
-    let pmt_section = si_reader::read_section(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
-    let pmt = parse_pmt(&pmt_section)?;
+/// The PID set that makes up one service: PAT, its PMT, the PCR PID, any
+/// CA PIDs (ECM/EMM) and every elementary stream. This is what the DVB
+/// path taps in the kernel and the px4 path filters in userspace — the
+/// set is identical so the output TS has the same shape either way.
+fn service_pids(pmt_pid: u16, pmt: &Pmt) -> Vec<u16> {
     let mut pids = vec![0x0000, pmt_pid];
     if pmt.pcr_pid != 0x1fff {
         pids.push(pmt.pcr_pid);
     }
-    pids.extend(pmt.ca_pids);
-    for stream in pmt.streams {
+    pids.extend(pmt.ca_pids.iter().copied());
+    for stream in &pmt.streams {
         pids.push(stream.pid);
     }
     pids.sort_unstable();
     pids.dedup();
-    Ok(pids)
+    pids
+}
+
+fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvb_rs::Result<Vec<u16>> {
+    let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
+    let pat = parse_pat(&pat_section)?;
+    let pmt_pid = find_pmt_pid(&pat, service_id)?;
+    let pmt_section = si_reader::read_section(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
+    let pmt = parse_pmt(&pmt_section)?;
+    Ok(service_pids(pmt_pid, &pmt))
+}
+
+/// The px4 tune loop: open the chardev, convert the channel's frequency
+/// to a physical channel, read PAT/PMT off the full mux in userspace,
+/// filter to the service's PIDs, and stream with the same stall watchdog
+/// as the DVB path.
+///
+/// The output contract matches the DVB backend exactly — PAT + PMT +
+/// service PIDs — so b25-rs and everything downstream sees the same TS
+/// shape whichever backend produced it.
+fn tune_stream_px4(
+    adapter: u32,
+    entry: &dvb_rs::config::DvbV5Entry,
+    full_mux: bool,
+    mut out: Box<dyn Write>,
+) -> dvb_rs::Result<()> {
+    let mut dev = px4::Px4Device::open(adapter)?;
+    let ch = px4::physical_from_frequency(entry.channel.frequency)?;
+    dev.tune_isdbt(ch)?;
+    info!(
+        "px4: tuned UHF {ch} (freq_no {}) on /dev/px4video{adapter}",
+        px4::freq_no_for_physical(ch)
+    );
+
+    // There is no kernel demux on px4: PAT/PMT come off the chardev's
+    // full mux, reassembled in userspace, and the PID tap is a userspace
+    // filter over the same stream.
+    let mut source: Box<dyn Read> = if full_mux {
+        warn!("px4: full mux requested; streaming every PID");
+        Box::new(dev)
+    } else {
+        let pat_section =
+            px4::read_sections_px4(&mut dev, 0x0000, 0x00, SI_PID_READ_TIMEOUT, true)?;
+        let pat = parse_pat(&pat_section[0])?;
+        let pmt_pid = find_pmt_pid(&pat, entry.channel.service_id)?;
+        let pmt_section =
+            px4::read_sections_px4(&mut dev, pmt_pid, 0x02, SI_PID_READ_TIMEOUT, true)?;
+        let pids = service_pids(pmt_pid, &parse_pmt(&pmt_section[0])?);
+        info!("px4: locked; service {} pids={:?}", entry.channel.service_id, pids);
+        Box::new(px4::TsPidFilter::new(dev, &pids))
+    };
+
+    let mut buf = vec![0u8; BUF];
+    let mut last_data = Instant::now();
+    loop {
+        let n = match source.read(&mut buf) {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                if last_data.elapsed() >= DVR_STALL_TIMEOUT {
+                    return Err(format!(
+                        "px4 delivered no data for {}s; aborting (signal loss or driver hang?)",
+                        DVR_STALL_TIMEOUT.as_secs()
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if last_data.elapsed() >= DVR_STALL_TIMEOUT {
+                    return Err(format!(
+                        "px4 delivered no data for {}s; aborting (signal loss or driver hang?)",
+                        DVR_STALL_TIMEOUT.as_secs()
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        last_data = Instant::now();
+        out.write_all(&buf[..n])?;
+        let _ = out.flush();
+    }
 }
 
 fn bounded_epg_collect_secs(schedule: bool, collect_secs: Option<u64>) -> dvb_rs::Result<u64> {
@@ -227,6 +334,7 @@ fn main() -> dvb_rs::Result<()> {
             adapter,
             frontend,
             demux,
+            backend,
             channels,
             output,
             lock_timeout_ms,
@@ -236,6 +344,17 @@ fn main() -> dvb_rs::Result<()> {
             let _lock = acquire_adapter_lock(adapter)?;
             let entries = config::load_channel_entries(&channels)?;
             let entry = config::find_entry(&entries, &name)?;
+
+            let mut out: Box<dyn Write> = if output == "-" {
+                Box::new(io::stdout().lock())
+            } else {
+                Box::new(File::create(&output)?)
+            };
+
+            if backend_is_px4(&backend)? {
+                return tune_stream_px4(adapter, entry, full_mux, out);
+            }
+
             let fe = Frontend::open_rw(adapter, frontend)?;
             tune_frontend(&fe, entry)?;
             wait_lock(
@@ -265,12 +384,6 @@ fn main() -> dvb_rs::Result<()> {
             }
             let mut dvr = DvrReader::open_ro(adapter, demux)?;
             let mut buf = vec![0u8; BUF];
-
-            let mut out: Box<dyn Write> = if output == "-" {
-                Box::new(io::stdout().lock())
-            } else {
-                Box::new(File::create(&output)?)
-            };
 
             let mut last_data = Instant::now();
             loop {
@@ -303,6 +416,7 @@ fn main() -> dvb_rs::Result<()> {
             adapter,
             frontend,
             demux,
+            backend,
             channels,
             frequency,
             bandwidth_hz,
@@ -327,15 +441,23 @@ fn main() -> dvb_rs::Result<()> {
                 (None, f, bandwidth_hz)
             };
             let entry_ref = entry.as_ref();
-            let ch = scan::scan_current_transport(
-                adapter,
-                frontend,
-                demux,
-                &delivery,
-                freq,
-                if bw > 0 { bw } else { 6_000_000 },
-                entry_ref,
-            )?;
+            let ch = if backend_is_px4(&backend)? {
+                info!(
+                    "px4: scanning UHF {} on /dev/px4video{adapter}",
+                    px4::physical_from_frequency(freq)?
+                );
+                scan::scan_current_transport_px4(adapter, &delivery, freq, bw)?
+            } else {
+                scan::scan_current_transport(
+                    adapter,
+                    frontend,
+                    demux,
+                    &delivery,
+                    freq,
+                    if bw > 0 { bw } else { 6_000_000 },
+                    entry_ref,
+                )?
+            };
             if merge {
                 let mut doc = config::load_channels_document(&output)?;
                 let report = scan::merge_scanned(&mut doc, &ch, add_new);
@@ -403,7 +525,20 @@ fn main() -> dvb_rs::Result<()> {
                 );
             }
         }
-        Cmd::FeInfo { adapter, frontend } => {
+        Cmd::FeInfo {
+            adapter,
+            frontend,
+            backend,
+        } => {
+            if backend_is_px4(&backend)? {
+                let dev = px4::Px4Device::open(adapter)?;
+                println!("px4video{adapter} (px4_drv chardev backend)");
+                match dev.cnr() {
+                    Ok(cnr) => println!("cnr (raw): {cnr}"),
+                    Err(e) => println!("cnr: unavailable ({e})"),
+                }
+                return Ok(());
+            }
             let fe = Frontend::open_rw(adapter, frontend)?;
             let mut info = ffi::dvb_frontend_info::default();
             fe.get_frontend_info(&mut info)?;
@@ -450,6 +585,7 @@ fn main() -> dvb_rs::Result<()> {
             adapter,
             frontend,
             demux,
+            backend,
             channels,
             lock_timeout_ms,
             schedule,
@@ -464,30 +600,8 @@ fn main() -> dvb_rs::Result<()> {
             let entry = config::find_entry(&entries, &name)?;
             let service_id = entry.channel.service_id;
 
-            let fe = Frontend::open_rw(adapter, frontend)?;
-            tune_frontend(&fe, entry)?;
-            wait_lock(
-                &fe,
-                Duration::from_millis(lock_timeout_ms),
-                Duration::from_millis(100),
-            )?;
-            info!("locked on {}; service_id={}", name, service_id);
-
             let secs = bounded_epg_collect_secs(schedule, collect_secs)?;
             let deadline = Instant::now() + Duration::from_secs(secs);
-
-            // The Siano USB driver does not support kernel section filter (DMX_SET_FILTER) for
-            // EIT on PID 0x0012. Use PES tap filters instead: this routes only the EIT PIDs to
-            // the DVR device, reducing USB bandwidth and packet loss compared to the full-mux
-            // approach, while we reassemble sections in userspace.
-            //
-            // Both EIT PIDs are tapped: 0x0012 carries the guide for the regular services and
-            // 0x0027 the one for partial-reception (ワンセグ / 携帯) ones. They are separate
-            // streams, so tapping only the first left every one-seg service with an empty
-            // schedule.
-            let eit_pids = [eit::EIT_PID, eit::EIT_PID_ONESEG];
-            let _taps = PidTaps::start(adapter, demux, &eit_pids)?;
-            let mut dvr = DvrReader::open_ro(adapter, demux)?;
 
             let mut all_sections: Vec<EitSection> = Vec::new();
             let mut seen: HashSet<(u16, u8, u8)> = HashSet::new();
@@ -496,24 +610,78 @@ fn main() -> dvb_rs::Result<()> {
             // this transport stream, so restricting to the named one threw
             // away the siblings' guide for nothing.
             let only = if only_service { Some(service_id) } else { None };
-            info!(
-                "collecting EIT for {secs}s (PES tap on PID 0x0012 + 0x0027, userspace assembly){}...",
-                if only.is_some() {
-                    format!(", service {service_id} only")
-                } else {
-                    ", all services on this mux".to_string()
-                }
-            );
-            collect_eit_from_dvr(
-                &mut dvr,
-                &eit_pids,
-                only,
-                schedule,
-                deadline,
-                &mut all_sections,
-                &mut seen,
-            );
-            drop(_taps);
+
+            // Both EIT PIDs are tapped: 0x0012 carries the guide for the regular services and
+            // 0x0027 the one for partial-reception (ワンセグ / 携帯) ones. They are separate
+            // streams, so tapping only the first left every one-seg service with an empty
+            // schedule.
+            let eit_pids = [eit::EIT_PID, eit::EIT_PID_ONESEG];
+
+            if backend_is_px4(&backend)? {
+                let mut dev = px4::Px4Device::open(adapter)?;
+                let ch = px4::physical_from_frequency(entry.channel.frequency)?;
+                dev.tune_isdbt(ch)?;
+                info!(
+                    "px4: locked on {} (UHF {ch}); service_id={}",
+                    name, service_id
+                );
+                // No kernel demux on px4: the full mux comes off the
+                // chardev, EIT PIDs are filtered in userspace, and the
+                // sections are assembled by the same loop as the DVB path.
+                let mut filtered = px4::TsPidFilter::new(dev, &eit_pids);
+                info!(
+                    "collecting EIT for {secs}s (px4, userspace PID filter + assembly){}...",
+                    if only.is_some() {
+                        format!(", service {service_id} only")
+                    } else {
+                        ", all services on this mux".to_string()
+                    }
+                );
+                collect_eit_from_dvr(
+                    &mut filtered,
+                    &eit_pids,
+                    only,
+                    schedule,
+                    deadline,
+                    &mut all_sections,
+                    &mut seen,
+                );
+            } else {
+                let fe = Frontend::open_rw(adapter, frontend)?;
+                tune_frontend(&fe, entry)?;
+                wait_lock(
+                    &fe,
+                    Duration::from_millis(lock_timeout_ms),
+                    Duration::from_millis(100),
+                )?;
+                info!("locked on {}; service_id={}", name, service_id);
+
+                // The Siano USB driver does not support kernel section filter (DMX_SET_FILTER) for
+                // EIT on PID 0x0012. Use PES tap filters instead: this routes only the EIT PIDs to
+                // the DVR device, reducing USB bandwidth and packet loss compared to the full-mux
+                // approach, while we reassemble sections in userspace.
+                let _taps = PidTaps::start(adapter, demux, &eit_pids)?;
+                let mut dvr = DvrReader::open_ro(adapter, demux)?;
+
+                info!(
+                    "collecting EIT for {secs}s (PES tap on PID 0x0012 + 0x0027, userspace assembly){}...",
+                    if only.is_some() {
+                        format!(", service {service_id} only")
+                    } else {
+                        ", all services on this mux".to_string()
+                    }
+                );
+                collect_eit_from_dvr(
+                    &mut dvr,
+                    &eit_pids,
+                    only,
+                    schedule,
+                    deadline,
+                    &mut all_sections,
+                    &mut seen,
+                );
+                drop(_taps);
+            }
 
             // Gather all events, deduplicate by event_id (keep the richest copy: same id is
             // often sent as TBC placeholder first, then filled in later sections / repetitions).
@@ -566,13 +734,17 @@ fn main() -> dvb_rs::Result<()> {
 
 // ── EIT collection ───────────────────────────────────────────────────────────
 
-/// Collect EIT sections from the DVR tap until `deadline`.
+/// Collect EIT sections from a TS source until `deadline`.
 ///
 /// `only_service` restricts the harvest to one service_id; `None` (the
 /// default) keeps the whole transport stream, which is what makes one tune
 /// yield the guide for every service on the mux.
+///
+/// The source is any byte stream of 188-byte TS packets already reduced to
+/// the EIT PIDs (a kernel demux tap on the DVB backend, a `TsPidFilter`
+/// over the px4 chardev's full mux on this one).
 fn collect_eit_from_dvr(
-    dvr: &mut DvrReader,
+    src: &mut dyn Read,
     pids: &[u16],
     only_service: Option<u16>,
     include_schedule: bool,
@@ -594,15 +766,22 @@ fn collect_eit_from_dvr(
         if Instant::now() >= deadline {
             break;
         }
-        let n = match dvr.read(&mut buf) {
+        let n = match src.read(&mut buf) {
             Ok(n) if n > 0 => n,
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // The px4 chardev is nonblocking; a silent frontend reads
+                // as WouldBlock until the deadline, same as the DVB path's
+                // Ok(0).
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             Err(e) => {
-                log::debug!("dvr read: {e}");
+                log::debug!("eit source read: {e}");
                 break;
             }
         };
