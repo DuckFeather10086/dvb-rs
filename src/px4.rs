@@ -16,6 +16,18 @@
 //!
 //! The ioctl numbers and struct layouts are the driver's public userspace
 //! ABI (`include/ptx_ioctl.h`); the same definitions power recisdb-rs.
+//! Checked against tsukumijima/px4_drv (2026-08-30): magic 0x8d, commands
+//! 0x01 `_IOW struct ptx_freq`, 0x02/0x03 `_IO`, 0x04 `_IOR int *`, and
+//! `driver/ptx_chrdev.c` converts a terrestrial `freq_no` with
+//! `freq = 95143 + freq_no * 6000` kHz — 63 → 473143 kHz, which is UHF
+//! 13ch, so the mapping below is the driver's own.
+//!
+//! `PTX_SET_SYSTEM_MODE` is deliberately not sent. With no mode set the
+//! driver infers one from `freq_no` (below 24 is ISDB-S, 24 and up is
+//! ISDB-T), and every terrestrial channel here lands at 63 or above — so a
+//! T-capable chardev tunes and an S-only one refuses, which is the answer
+//! we want. It is also what recpt1 does, which is what px4_drv's chardev
+//! ABI exists to serve.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -194,12 +206,50 @@ impl<R: Read> TsPidFilter<R> {
         }
     }
 
+    /// Where a TS packet starts in `carry`, or `None` if this buffer holds
+    /// no confirmable sync.
+    ///
+    /// A lone 0x47 is not sync: it is an ordinary payload byte one time in
+    /// 256, and locking onto one yields packets whose PID field is payload —
+    /// which this filter would then silently drop (or worse, silently keep).
+    /// So a candidate is only accepted when the byte 188 further on is 0x47
+    /// too, and a candidate too close to the end of the buffer is left for
+    /// the next read to confirm rather than guessed at.
+    fn sync_offset(&self) -> Option<usize> {
+        for off in 0..self.carry.len() {
+            if self.carry[off] != 0x47 {
+                continue;
+            }
+            return match self.carry.get(off + TS_PACKET_SIZE) {
+                Some(0x47) => Some(off),
+                // Confirmable only once more bytes arrive.
+                None => None,
+                Some(_) => continue,
+            };
+        }
+        None
+    }
+
     /// Move complete, kept packets from `carry` into `staged`.
     fn ingest(&mut self) {
-        // Resync: a leading byte that is not 0x47 means the stream was
-        // misaligned; drop bytes until the next sync candidate.
-        while !self.carry.is_empty() && self.carry[0] != 0x47 {
-            self.carry.remove(0);
+        // Resync: drop whatever precedes the first confirmable packet start.
+        // Normally this is a no-op — px4_drv delivers aligned packets — and
+        // it costs one pass over the buffer when it is not.
+        if self.carry.first() != Some(&0x47) {
+            match self.sync_offset() {
+                Some(0) => {}
+                Some(off) => {
+                    self.carry.drain(..off);
+                }
+                // Nothing confirmable in hand: keep only enough to confirm
+                // against the next read, so a stream of pure noise cannot
+                // grow this without bound.
+                None => {
+                    let keep_from = self.carry.len().saturating_sub(TS_PACKET_SIZE);
+                    self.carry.drain(..keep_from);
+                    return;
+                }
+            }
         }
         let mut consumed = 0;
         while self.carry.len() - consumed >= TS_PACKET_SIZE {
@@ -330,31 +380,6 @@ mod tests {
         p
     }
 
-    /// One complete single-section SI table on `pid`.
-    fn section_packet(pid: u16, cc: u8, table_id: u8, section_num: u8, last: u8) -> Vec<u8> {
-        // section_length = 13 payload; section: table_id, flags+len,
-        // tsid(2) ver(1) sec(1) last(1), crc(4).
-        let payload: Vec<u8> = vec![
-            table_id,
-            0xf0,
-            13, // section_length low byte (high nibble 0)
-            0x00,
-            0x01, // tsid
-            0xc1, // version + current
-            section_num,
-            last,
-            0xde,
-            0xad,
-            0xbe,
-            0xef,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ];
-        pkt(pid, cc, true, &payload)
-    }
-
     #[test]
     fn pid_filter_keeps_only_wanted_pids() {
         let wanted = vec![0x0000, 0x0100];
@@ -393,6 +418,34 @@ mod tests {
         f.read_to_end(&mut out).unwrap();
         assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
         assert!(out.chunks_exact(TS_PACKET_SIZE).all(|w| w[0] == 0x47));
+    }
+
+    #[test]
+    fn pid_filter_does_not_lock_onto_a_payload_sync_byte() {
+        // A 0x47 in the run-in is not a packet start, and taking it for one
+        // reads the PID out of payload — which is how a filter comes to drop
+        // every packet of a channel that is arriving perfectly well. The
+        // 0x47 exactly 188 bytes on is what tells a real packet start from
+        // a stray byte. (A stray that repeated at exactly the packet period
+        // would survive this, as it survives every bounded sync search;
+        // what this rules out is the ordinary random one, which arrives
+        // once in every 256 payload bytes.)
+        let mut run_in = vec![0xbbu8; 128];
+        run_in[5] = 0x47;
+        let mut stream = run_in;
+        stream.extend(pkt(0x0100, 0, true, &[0xbb; 100]));
+        stream.extend(pkt(0x0100, 1, false, &[0xbb; 100]));
+
+        let src = std::io::Cursor::new(stream);
+        let mut f = TsPidFilter::new(src, &[0x0100]);
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), 2 * TS_PACKET_SIZE, "resynced onto a false sync");
+        for chunk in out.chunks_exact(TS_PACKET_SIZE) {
+            assert_eq!(chunk[0], 0x47);
+            let pid = ((chunk[1] as u16 & 0x1f) << 8) | chunk[2] as u16;
+            assert_eq!(pid, 0x0100);
+        }
     }
 
     #[test]

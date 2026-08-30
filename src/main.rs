@@ -249,6 +249,7 @@ fn tune_stream_px4(
     adapter: u32,
     entry: &dvb_rs::config::DvbV5Entry,
     full_mux: bool,
+    lock_timeout: Duration,
     mut out: Box<dyn Write>,
 ) -> dvb_rs::Result<()> {
     let mut dev = px4::Px4Device::open(adapter)?;
@@ -266,8 +267,13 @@ fn tune_stream_px4(
         warn!("px4: full mux requested; streaming every PID");
         Box::new(dev)
     } else {
+        // The PAT is where a px4 tune finds out whether it has a signal:
+        // the chardev has no FE_HAS_LOCK to poll, so "the mux is arriving"
+        // is the only lock report there is. That makes this the frontend
+        // lock budget rather than an SI read budget, and `--lock-timeout-ms`
+        // therefore means the same thing on both backends.
         let pat_section =
-            px4::read_sections_px4(&mut dev, 0x0000, 0x00, SI_PID_READ_TIMEOUT, true)?;
+            px4::read_sections_px4(&mut dev, 0x0000, 0x00, lock_timeout, true)?;
         let pat = parse_pat(&pat_section[0])?;
         let pmt_pid = find_pmt_pid(&pat, entry.channel.service_id)?;
         let pmt_section =
@@ -352,7 +358,13 @@ fn main() -> dvb_rs::Result<()> {
             };
 
             if backend_is_px4(&backend)? {
-                return tune_stream_px4(adapter, entry, full_mux, out);
+                return tune_stream_px4(
+                    adapter,
+                    entry,
+                    full_mux,
+                    Duration::from_millis(lock_timeout_ms),
+                    out,
+                );
             }
 
             let fe = Frontend::open_rw(adapter, frontend)?;
