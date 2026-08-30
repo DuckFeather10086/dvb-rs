@@ -17,6 +17,11 @@
 //! sections from the raw TS packets in userspace ([`TsSectionAssembler`]).
 //! Slower and a little more code, but it works on every driver.
 //!
+//! The px4 chardev backend has the same problem one layer up: there is no
+//! kernel demux at all, so its PID reduction happens in userspace
+//! ([`crate::px4::TsPidFilter`]) and the sections are assembled by the
+//! same [`read_sections_from_source`] loop.
+//!
 //! Anything in this crate that needs an SI table should go through here.
 //! Do not reintroduce `DMX_SET_FILTER` without running
 //! `scripts/driver-audit.sh` on smsusb hardware.
@@ -72,6 +77,35 @@ pub fn read_sections(
     let dm = Demux::open_rw(adapter, demux)?;
     dm.tap_pid_to_dvr(pid)?;
     let mut dvr = DvrReader::open_ro_nonblocking(adapter, demux)?;
+    // The kernel demux tap has already reduced the stream to `pid`, so the
+    // generic loop gets exactly the packets it wants.
+    let out = read_sections_from_source(&mut dvr, pid, table_id, timeout, first_only)?;
+    drop(dm);
+    if out.is_empty() {
+        return Err(Error::Si(format!(
+            "timed out reading table 0x{table_id:02x} from PID 0x{pid:04x}"
+        )));
+    }
+    Ok(out)
+}
+
+/// Read every section with `table_id` arriving on `pid` from a live
+/// source, reassembling sections in userspace.
+///
+/// The DVB path reaches this with the stream already reduced to `pid` by
+/// a kernel demux tap; the px4 path reaches it through a
+/// [`crate::px4::TsPidFilter`] over the chardev's full mux. Either way
+/// the assembler only ever sees its own PID.
+///
+/// With `first_only`, returns as soon as one section matches. Returns
+/// whatever arrived when `timeout` expires, possibly empty.
+pub(crate) fn read_sections_from_source<R: io::Read>(
+    src: &mut R,
+    pid: u16,
+    table_id: u8,
+    timeout: Duration,
+    first_only: bool,
+) -> Result<Vec<Vec<u8>>> {
     let mut asm = TsSectionAssembler::new(pid);
     let mut buf = vec![0u8; TS_PACKET_SIZE * 64];
     let deadline = Instant::now() + timeout;
@@ -82,7 +116,7 @@ pub fn read_sections(
     let mut last_section: Option<u8> = None;
 
     while Instant::now() < deadline {
-        let n = match dvr.read(&mut buf) {
+        let n = match src.read(&mut buf) {
             Ok(n) if n > 0 => n,
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -105,16 +139,12 @@ pub fn read_sections(
                     continue;
                 }
                 if first_only {
-                    drop(dm);
                     return Ok(vec![section]);
                 }
                 let (num, last) = match section_numbers(&section) {
                     Some(v) => v,
                     // Short-form section: no numbering to track, take it.
-                    None => {
-                        drop(dm);
-                        return Ok(vec![section]);
-                    }
+                    None => return Ok(vec![section]),
                 };
                 last_section = Some(last);
                 let idx = num as usize;
@@ -133,20 +163,37 @@ pub fn read_sections(
             }
         }
     }
-    drop(dm);
 
-    let out: Vec<Vec<u8>> = collected.into_iter().flatten().collect();
-    if out.is_empty() {
-        return Err(Error::Si(format!(
-            "timed out reading table 0x{table_id:02x} from PID 0x{pid:04x}"
-        )));
-    }
-    Ok(out)
+    Ok(collected.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn pkt(pid: u16, cc: u8, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; TS_PACKET_SIZE];
+        p[0] = 0x47;
+        p[1] = ((pid >> 8) as u8 & 0x1f) | if pusi { 0x40 } else { 0 };
+        p[2] = pid as u8;
+        p[3] = 0x10 | (cc & 0x0f);
+        if pusi {
+            p[4] = 0;
+            p[5..5 + payload.len()].copy_from_slice(payload);
+        } else {
+            p[4..4 + payload.len()].copy_from_slice(payload);
+        }
+        p
+    }
+
+    fn section_packet(pid: u16, cc: u8, table_id: u8, section_num: u8, last: u8) -> Vec<u8> {
+        let payload: Vec<u8> = vec![
+            table_id, 0xf0, 13, 0x00, 0x01, 0xc1, section_num, last, 0xde, 0xad, 0xbe, 0xef,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        pkt(pid, cc, true, &payload)
+    }
 
     #[test]
     fn section_numbers_reads_long_form_header() {
@@ -161,5 +208,42 @@ mod tests {
         let short_form = [0x42u8, 0x70, 0x10, 0, 0, 0, 0, 0];
         assert_eq!(section_numbers(&short_form), None);
         assert_eq!(section_numbers(&[0x42u8, 0xf0]), None);
+    }
+
+    #[test]
+    fn generic_loop_reads_first_section_of_a_pid() {
+        let mut stream = Vec::new();
+        stream.extend(section_packet(0x0000, 0, 0x00, 0, 0));
+        stream.extend(section_packet(0x0100, 0, 0x42, 0, 0));
+        let mut src = Cursor::new(stream);
+        let sections =
+            read_sections_from_source(&mut src, 0x0000, 0x00, Duration::from_secs(1), true)
+                .unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0][0], 0x00);
+    }
+
+    #[test]
+    fn generic_loop_collects_multi_section_tables() {
+        let mut stream = Vec::new();
+        for num in [0u8, 1u8] {
+            stream.extend(section_packet(0x0011, num, 0x42, num, 1));
+        }
+        let mut src = Cursor::new(stream);
+        let sections =
+            read_sections_from_source(&mut src, 0x0011, 0x42, Duration::from_secs(1), false)
+                .unwrap();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0][6], 0);
+        assert_eq!(sections[1][6], 1);
+    }
+
+    #[test]
+    fn generic_loop_times_out_empty() {
+        let mut src = Cursor::new(Vec::new());
+        let sections =
+            read_sections_from_source(&mut src, 0x0000, 0x00, Duration::from_millis(30), false)
+                .unwrap();
+        assert!(sections.is_empty());
     }
 }

@@ -166,3 +166,9 @@ impl DvrReader {
         }
     }
 }
+
+impl Read for DvrReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.fd.read(buf)
+    }
+}

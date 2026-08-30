@@ -3,7 +3,7 @@ use crate::config::DvbV5Entry;
 use crate::error::{Error, Result};
 use crate::frontend::Frontend;
 use crate::si_reader::{read_section, read_sections, SI_READ_TIMEOUT};
-use crate::si_tables::{parse_pat, parse_sdt};
+use crate::si_tables::{parse_pat, parse_sdt, PatProgram};
 use crate::tuner::{build_props_simple_isdbt, tune_frontend, wait_lock};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -273,9 +273,63 @@ pub fn scan_current_transport(
         false,
     )?;
 
+    channels_from_pat_sdt(&pat, &sdt_sections, &del, tune_freq, tune_bw)
+}
+
+/// Scan one transport on the px4 backend: tune the physical channel the
+/// frequency maps to, then read PAT + SDT off the chardev's full mux in
+/// userspace (there is no kernel demux to tap).
+pub fn scan_current_transport_px4(
+    adapter: u32,
+    delivery: &str,
+    frequency: u32,
+    bandwidth_hz: u32,
+) -> Result<ChannelsFile> {
+    use crate::px4::{self, Px4Device};
+
+    let mut dev = Px4Device::open(adapter)?;
+    let ch = px4::physical_from_frequency(frequency)?;
+    dev.tune_isdbt(ch)?;
+
+    let pat_section = px4::read_sections_px4(&mut dev, PAT_PID, PAT_TABLE_ID, SI_READ_TIMEOUT, true)?;
+    let pat = parse_pat(&pat_section[0])?;
+
+    let sdt_sections = px4::read_sections_px4(
+        &mut dev,
+        SDT_PID,
+        SDT_ACTUAL_TABLE_ID,
+        SI_READ_TIMEOUT,
+        false,
+    )?;
+
+    let del = if delivery.is_empty() {
+        "ISDBT".to_string()
+    } else {
+        delivery.to_string()
+    };
+    let bw = if bandwidth_hz > 0 {
+        bandwidth_hz
+    } else {
+        6_000_000
+    };
+    channels_from_pat_sdt(&pat, &sdt_sections, &del, frequency, bw)
+}
+
+/// Build the scanned channel list from a parsed PAT and the SDT sections.
+///
+/// The SDT is what decides membership: every service it names becomes a
+/// record, and a mux whose SDT could not be read falls back to PAT program
+/// numbers (which `--add-new` then refuses to add — see `merge_scanned`).
+fn channels_from_pat_sdt(
+    pat: &[PatProgram],
+    sdt_sections: &[Vec<u8>],
+    del: &str,
+    tune_freq: u32,
+    tune_bw: u32,
+) -> Result<ChannelsFile> {
     let mut channels = Vec::new();
     let mut seen_service_ids = Vec::new();
-    for section in &sdt_sections {
+    for section in sdt_sections {
         let services = match parse_sdt(section) {
             Ok(s) => s,
             // One malformed section shouldn't lose the others.
@@ -296,7 +350,7 @@ pub fn scan_current_transport(
             }
             channels.push(Channel {
                 name,
-                delivery: del.clone(),
+                delivery: del.to_string(),
                 frequency: tune_freq,
                 bandwidth_hz: tune_bw,
                 service_id: s.service_id,
@@ -313,7 +367,7 @@ pub fn scan_current_transport(
             }
             channels.push(Channel {
                 name: format!("program_{}", p.program_number),
-                delivery: del.clone(),
+                delivery: del.to_string(),
                 frequency: tune_freq,
                 bandwidth_hz: tune_bw,
                 service_id: p.program_number,

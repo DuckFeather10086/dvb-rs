@@ -5,6 +5,7 @@ mod dtv_cmds;
 pub mod eit;
 pub mod error;
 pub mod frontend;
+pub mod px4;
 pub mod scan;
 pub mod si_reader;
 pub mod si_tables;
