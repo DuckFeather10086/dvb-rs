@@ -2,18 +2,24 @@
 //!
 //! **Why this exists instead of `DMX_SET_FILTER`.** The kernel demux can
 //! filter and deliver whole sections by itself, which is the obvious way to
-//! read a table — but the Siano/smsusb driver does not implement section
-//! filtering. A `set_section_filter` + read on that hardware blocks forever
-//! (no error, no data), which is exactly how `dvbr scan` came to hang on
-//! every invocation while `dvbr tune` — which already used the approach in
-//! this module — worked fine.
+//! read a table — but on the Siano/smsusb driver the sections never arrive.
+//! `DMX_SET_FILTER` *succeeds* there; it is the read after it that waits
+//! forever, with no error and no data, which is exactly how `dvbr scan` came
+//! to hang on every invocation while `dvbr tune` — which already used the
+//! approach in this module — worked fine.
+//!
+//! Note the trap if you go to re-check this: a section filter on **PAT** does
+//! come back, provided something else is already tapping PID 0, so a casual
+//! test says the driver is fine. Test an SI PID. Measurements, and the
+//! configurations tried, are in `DRIVERS.md`.
 //!
 //! So: tap the PID straight through to the DVR device and reassemble
 //! sections from the raw TS packets in userspace ([`TsSectionAssembler`]).
 //! Slower and a little more code, but it works on every driver.
 //!
 //! Anything in this crate that needs an SI table should go through here.
-//! Do not reintroduce `DMX_SET_FILTER` without testing on smsusb hardware.
+//! Do not reintroduce `DMX_SET_FILTER` without running
+//! `scripts/driver-audit.sh` on smsusb hardware.
 
 use std::io;
 use std::time::{Duration, Instant};
