@@ -2,16 +2,21 @@
 //!
 //! **Why this exists instead of `DMX_SET_FILTER`.** The kernel demux can
 //! filter and deliver whole sections by itself, which is the obvious way to
-//! read a table — but on the Siano/smsusb driver the sections never arrive.
-//! `DMX_SET_FILTER` *succeeds* there; it is the read after it that waits
-//! forever, with no error and no data, which is exactly how `dvbr scan` came
-//! to hang on every invocation while `dvbr tune` — which already used the
-//! approach in this module — worked fine.
+//! read a table, and `dvbr scan` used to do exactly that — and hung on every
+//! invocation, while `dvbr tune`, which already used the approach in this
+//! module, worked fine. Tapping the PID and assembling in userspace is what
+//! fixed it.
 //!
-//! Note the trap if you go to re-check this: a section filter on **PAT** does
-//! come back, provided something else is already tapping PID 0, so a casual
-//! test says the driver is fine. Test an SI PID. Measurements, and the
-//! configurations tried, are in `DRIVERS.md`.
+//! The account of *why* it hung has been wrong twice and is now, on this
+//! box, not reproducible at all: measured 2026-08-30, smsusb delivers
+//! sections for SDT and EIT perfectly well. Read `DRIVERS.md` before
+//! believing anything about it — including the possibility that the real
+//! culprit was the smsdvb WARN storm documented in the same file, which
+//! would make it a driver defect that has since been configured away.
+//!
+//! What has not changed is the reason this module exists. It works on every
+//! driver, and the px4 backend has no kernel demux to ask in the first
+//! place.
 //!
 //! So: tap the PID straight through to the DVR device and reassemble
 //! sections from the raw TS packets in userspace ([`TsSectionAssembler`]).

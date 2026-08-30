@@ -176,9 +176,14 @@ static int do_taps(const char *dev, int max)
 	for (n = 0; n < max; n++) {
 		fds[n] = open(dev, O_RDWR);
 		if (fds[n] < 0) {
+			/* EMFILE from a demux device is ambiguous and usually is not
+			 * about us: dvb-core returns it from dvb_dmxdev_open() when
+			 * every slot in the adapter's filter table is taken, and that
+			 * table is shared with whatever else has the adapter open --
+			 * our own tune included.  The caller adds the two up. */
 			printf("open failed at %d: %s%s\n", n, strerror(errno),
-			       errno == EMFILE || errno == ENFILE
-				       ? "  (our fd limit, not the driver's)" : "");
+			       errno == EMFILE
+				       ? "  (dvb-core's filter table is full, most likely)" : "");
 			break;
 		}
 		if (set_tap(fds[n], 0x100 + n) < 0) {
@@ -249,7 +254,9 @@ grep -q "isdbt=yes" "$OUT/delsys.txt" \
 hdr "2-3. tune, lock, bytes"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
 t0=$(date +%s.%N)
-timeout "$SECS" "$DVBR" tune -a "$ADAPTER" -d "$DEMUX" \
+# dvbr's default log filter is `warn`, so without this the line the loop
+# below waits for is never printed and the lock time is never reported.
+RUST_LOG=${RUST_LOG:-info} timeout "$SECS" "$DVBR" tune -a "$ADAPTER" -d "$DEMUX" \
 	-c "$CHANNELS" "$CHANNEL" -o "$TS" >"$OUT/tune.out" 2>"$OUT/tune.err" &
 tunepid=$!
 
@@ -288,16 +295,36 @@ fi
 
 # ── 4, 5, 6. demux, while the frontend is up ───────────────────────────────
 hdr "4-6. demux, with the frontend tuned"
-"$OUT/probe" taps "$DMXDEV" 32 | sed 's/^/  /'
-"$OUT/probe" full "$DMXDEV" | sed 's/^/  /'
-# PAT is the wrong PID to ask about: on smsusb it comes back whenever some
-# other feed is already tapping it, and the driver then looks fine. SI is what
-# si_reader actually needs, so ask for SI.
+# Order is load-bearing, and getting it wrong is how this script produced a
+# result that contradicted DRIVERS.md. The section probe is a question about
+# what the *service tune* leaves reaching the demux, so it has to be asked
+# while that is still the only thing on the device. A full-mux tap (probe 5)
+# asks the device to forward every PID, and a driver that does not fully undo
+# that on close leaves SI arriving afterwards — at which point probe 6 answers
+# "sections are delivered" about a device configuration no ordinary tune
+# produces. So: sections first, then the tap count, and the full mux last.
+#
+# PAT is also the wrong PID to ask about: on smsusb it comes back whenever
+# some other feed is already tapping it, and the driver then looks fine. SI is
+# what si_reader actually needs, so ask for SI first and read PAT as the
+# control.
 for spec in "0x0011 0x42 SDT" "0x0012 0x4e EIT" "0x0000 0x00 PAT"; do
 	set -- $spec
 	echo "  DMX_SET_FILTER on PID $1 ($3), 10s budget:"
 	"$OUT/probe" sec "$DMXDEV" "$1" "$2" 10000 | sed 's/^/    /'
 done
+"$OUT/probe" taps "$DMXDEV" 32 | tee "$OUT/taps.txt" | sed 's/^/  /'
+"$OUT/probe" full "$DMXDEV" | sed 's/^/  /'
+# Question 4 is "how many taps does the driver allow", and the probe can only
+# see the ones it opened itself. The filter table is per adapter and our own
+# tune is holding a service's worth of it, so the answer is the sum -- without
+# which this reports a different number for every channel, since a service
+# with more elementary streams leaves fewer slots.
+probe_taps=$(sed -n 's/^taps=//p' "$OUT/taps.txt")
+tune_taps=$(sed -n 's/.*started \([0-9]*\) PID taps.*/\1/p' "$OUT/tune.err" | tail -1)
+if [ -n "${probe_taps:-}" ] && [ -n "${tune_taps:-}" ]; then
+	kv "filter table:" "$((probe_taps + tune_taps)) ($probe_taps here + $tune_taps held by our tune)"
+fi
 
 wait "$tunepid" 2>/dev/null
 sz=$(stat -c %s "$TS" 2>/dev/null || echo 0)
