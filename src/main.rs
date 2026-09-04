@@ -12,7 +12,7 @@ use dvb_rs::si_reader;
 use dvb_rs::si_tables::{parse_pat, parse_pmt, PatProgram, Pmt};
 use dvb_rs::signal;
 use dvb_rs::sys::ffi;
-use dvb_rs::tuner::{tune_frontend, wait_lock};
+use dvb_rs::tuner::{already_tuned, tune_frontend, wait_lock};
 use log::{info, warn};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 const BUF: usize = 188 * 512;
 const MAX_EPG_COLLECT_SECS: u64 = 60;
 const SI_PID_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the "the frontend is already on this mux" shortcut waits for SI
+/// before giving up and tuning for real. Short on purpose: it is the price of
+/// a wrong guess, paid on top of the full tune that follows, and a mux that is
+/// genuinely already locked delivers a PAT in about 95 ms.
+const FAST_PATH_SI_TIMEOUT: Duration = Duration::from_millis(1200);
 const DVR_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
@@ -203,6 +208,24 @@ fn acquire_adapter_lock(adapter: u32) -> dvb_rs::Result<Option<AdapterLock>> {
     }
 }
 
+/// Why a tune that "locked" delivered no SI.
+///
+/// Worth spelling out because the frontend's own report cannot be used to say
+/// it: smsusb answers `FE_READ_STATUS` with the previous tune's `FE_HAS_LOCK`
+/// 45µs after `DTV_TUNE`, so `wait_lock` returns immediately and never fires
+/// `LockTimeout`. Every genuinely dead aerial therefore arrives here, as a
+/// bare "PAT not found", pointing at SI parsing rather than at the coax.
+fn no_si_after_tune(entry: &dvb_rs::config::DvbV5Entry, cause: Error) -> Error {
+    Error::Msg(format!(
+        "tuned {} Hz but no usable SI arrived within {}s ({cause}) — no signal, \
+         the wrong frequency, or the aerial is disconnected. Note that a frontend \
+         reporting FE_HAS_LOCK does not rule this out: some drivers never clear \
+         the flag from the previous tune.",
+        entry.channel.frequency,
+        SI_PID_READ_TIMEOUT.as_secs(),
+    ))
+}
+
 fn find_pmt_pid(pat: &[PatProgram], service_id: u16) -> dvb_rs::Result<u16> {
     pat.iter()
         .find(|program| program.program_number == service_id)
@@ -228,8 +251,20 @@ fn service_pids(pmt_pid: u16, pmt: &Pmt) -> Vec<u16> {
     pids
 }
 
-fn service_pids_from_pat_pmt(adapter: u32, demux: u32, service_id: u16) -> dvb_rs::Result<Vec<u16>> {
-    let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, SI_PID_READ_TIMEOUT)?;
+/// Resolve a service to its PID set by reading the mux's PAT and then its PMT.
+///
+/// `pat_timeout` bounds the *first* read only. On a DVB frontend that is the
+/// read that waits out the demodulator's acquisition — smsusb reports
+/// `FE_HAS_LOCK` before it has any signal, so `wait_lock` returns instantly and
+/// this is where the 1.7s actually goes — which is why the caller varies it:
+/// generous after a real tune, short when only testing a shortcut.
+fn service_pids_from_pat_pmt(
+    adapter: u32,
+    demux: u32,
+    service_id: u16,
+    pat_timeout: Duration,
+) -> dvb_rs::Result<Vec<u16>> {
+    let pat_section = si_reader::read_section(adapter, demux, 0x0000, 0x00, pat_timeout)?;
     let pat = parse_pat(&pat_section)?;
     let pmt_pid = find_pmt_pid(&pat, service_id)?;
     let pmt_section = si_reader::read_section(adapter, demux, pmt_pid, 0x02, SI_PID_READ_TIMEOUT)?;
@@ -368,12 +403,65 @@ fn main() -> dvb_rs::Result<()> {
             }
 
             let fe = Frontend::open_rw(adapter, frontend)?;
-            tune_frontend(&fe, entry)?;
-            wait_lock(
-                &fe,
-                Duration::from_millis(lock_timeout_ms),
-                Duration::from_millis(100),
-            )?;
+
+            // Changing channel within one mux does not need the frontend
+            // touched at all, and touching it is by far the most expensive
+            // thing a tune does: 1.81s to the first TS packet after a
+            // `DTV_TUNE`, against 0.095s for tapping a PID on a demodulator
+            // that is already locked (measured on this box's Siano stick,
+            // and it holds whether or not the re-tune names the frequency it
+            // is already on). A demodulator keeps its lock after the process
+            // that set it exits, so this shortcut is available to a fresh
+            // dvb-rs and not only to a long-lived one.
+            //
+            // `already_tuned` is only ever a hint — see its own docs for why
+            // the frontend cannot be believed — so it is confirmed by reading
+            // the SI off the mux on a short budget, and anything short of a
+            // PAT that names this service means tuning for real after all.
+            let mut pids: Option<Vec<u16>> = None;
+            if !full_mux && already_tuned(&fe, entry) {
+                match service_pids_from_pat_pmt(
+                    adapter,
+                    demux,
+                    entry.channel.service_id,
+                    FAST_PATH_SI_TIMEOUT,
+                ) {
+                    Ok(p) => {
+                        info!(
+                            "frontend already locked to {} Hz; skipping the re-tune",
+                            entry.channel.frequency
+                        );
+                        pids = Some(p);
+                    }
+                    Err(e) => {
+                        info!(
+                            "frontend looked already tuned to {} Hz but no usable SI arrived \
+                             ({e}); tuning for real",
+                            entry.channel.frequency
+                        );
+                    }
+                }
+            }
+
+            if pids.is_none() {
+                tune_frontend(&fe, entry)?;
+                wait_lock(
+                    &fe,
+                    Duration::from_millis(lock_timeout_ms),
+                    Duration::from_millis(100),
+                )?;
+                if !full_mux {
+                    pids = Some(
+                        service_pids_from_pat_pmt(
+                            adapter,
+                            demux,
+                            entry.channel.service_id,
+                            SI_PID_READ_TIMEOUT,
+                        )
+                        .map_err(|e| no_si_after_tune(entry, e))?,
+                    );
+                }
+            }
 
             let _full_mux_demux;
             let _pid_taps;
@@ -384,7 +472,7 @@ fn main() -> dvb_rs::Result<()> {
                 _full_mux_demux = Some(dm);
                 _pid_taps = None;
             } else {
-                let pids = service_pids_from_pat_pmt(adapter, demux, entry.channel.service_id)?;
+                let pids = pids.expect("service PID set is resolved on both paths above");
                 info!(
                     "locked; starting service PID taps for service_id={} pids={:?}",
                     entry.channel.service_id, pids

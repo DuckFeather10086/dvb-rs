@@ -51,6 +51,25 @@ impl Frontend {
         Ok(())
     }
 
+    /// Read `DTV_*` properties back out of the frontend.
+    ///
+    /// Each element's `cmd` names what to read; the driver fills in `u.data`.
+    /// This is how a tune finds out what the frontend is *already* on, which
+    /// is what lets it skip re-acquiring a mux it is already locked to.
+    pub fn get_properties(&self, props: &mut [dtv_property]) -> Result<()> {
+        let mut cmd = dtv_properties {
+            num: props
+                .len()
+                .try_into()
+                .map_err(|_| Error::Msg("too many dtv properties".into()))?,
+            props: props.as_mut_ptr(),
+        };
+        unsafe {
+            ioctl::fe_read_properties(self.as_raw_fd(), &mut cmd)?;
+        }
+        Ok(())
+    }
+
     pub fn get_frontend_info(&self, info: &mut dvb_frontend_info) -> Result<()> {
         unsafe {
             ioctl::fe_get_info(self.as_raw_fd(), info)?;

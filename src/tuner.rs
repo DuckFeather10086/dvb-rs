@@ -244,6 +244,93 @@ pub fn tune_frontend(fe: &Frontend, entry: &DvbV5Entry) -> Result<()> {
     Ok(())
 }
 
+/// How far the frontend's reported frequency may sit from the one the
+/// channel names and still be the same transport. The terrestrial raster
+/// is 6 MHz, so anything this close is rounding in the driver rather than
+/// a different mux.
+const FREQ_MATCH_TOLERANCE_HZ: u32 = 50_000;
+
+/// What the frontend is currently tuned to: (delivery system, frequency Hz,
+/// bandwidth Hz). Read back with `FE_GET_PROPERTY`, so it reports the tune
+/// that is actually loaded — including one left behind by a *previous*
+/// process, since closing the frontend fd does not undo it.
+pub fn current_tuning(fe: &Frontend) -> Result<(u32, u32, u32)> {
+    let mut props = [
+        dtv_property {
+            cmd: DTV_DELIVERY_SYSTEM,
+            ..Default::default()
+        },
+        dtv_property {
+            cmd: DTV_FREQUENCY,
+            ..Default::default()
+        },
+        dtv_property {
+            cmd: DTV_BANDWIDTH_HZ,
+            ..Default::default()
+        },
+    ];
+    fe.get_properties(&mut props)?;
+    unsafe { Ok((props[0].u.data, props[1].u.data, props[2].u.data)) }
+}
+
+/// Whether the frontend is already locked to the transport `entry` names,
+/// so the tune can go straight to the demux instead of re-acquiring it.
+///
+/// This is worth asking because `DTV_TUNE` is expensive and unconditional:
+/// on a Siano stick, re-tuning to the frequency the demodulator is *already*
+/// locked to costs 1.81s before the first TS packet arrives, against 0.095s
+/// for tapping a PID without touching the frontend (measured on this box,
+/// repeatedly). A demodulator keeps its lock when the process that set it
+/// exits, so a channel change within one mux — TBS1 to TBS2, NHK総合 to
+/// NHK総合2 — can skip the re-acquisition entirely even though it is a fresh
+/// dvb-rs.
+///
+/// The answer is a hint, never a decision: the caller must confirm it by
+/// reading SI off the mux, and re-tune for real if nothing arrives. Two
+/// things make it a hint rather than a fact. `FE_READ_STATUS` is not
+/// trustworthy on every driver — smsusb reports `FE_HAS_LOCK` 45µs after a
+/// `DTV_TUNE` that has plainly not completed, i.e. it never clears the flag
+/// from the previous tune — and a frontend left mid-acquisition by a killed
+/// process reads exactly like a settled one.
+pub fn already_tuned(fe: &Frontend, entry: &DvbV5Entry) -> bool {
+    let (delsys, freq, bw) = match current_tuning(fe) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let want_delsys = parse_delivery(
+        entry
+            .raw
+            .get("DELIVERY_SYSTEM")
+            .map(String::as_str)
+            .unwrap_or("ISDBT"),
+    ) as u32;
+    if delsys != want_delsys {
+        return false;
+    }
+
+    let want_freq = match parse_u32(&entry.raw, "FREQUENCY") {
+        Some(f) => f,
+        None => return false,
+    };
+    if freq.abs_diff(want_freq) > FREQ_MATCH_TOLERANCE_HZ {
+        return false;
+    }
+
+    // Bandwidth only disqualifies when both sides state one: a driver that
+    // does not report it back reads as 0, which says nothing.
+    let want_bw = parse_u32(&entry.raw, "BANDWIDTH_HZ").unwrap_or(entry.channel.bandwidth_hz);
+    if bw != 0 && want_bw != 0 && bw != want_bw {
+        return false;
+    }
+
+    let mut mask = 0u32;
+    if unsafe { ioctl::fe_read_lock_status(fe.as_raw_fd(), &mut mask) }.is_err() {
+        return false;
+    }
+    mask & FE_HAS_LOCK != 0
+}
+
 pub fn wait_lock(fe: &Frontend, timeout: Duration, poll: Duration) -> Result<()> {
     let start = Instant::now();
     loop {

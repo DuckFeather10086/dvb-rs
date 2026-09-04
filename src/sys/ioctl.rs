@@ -21,3 +21,10 @@ pub unsafe fn fe_get_info(fd: RawFd, info: &mut dvb_frontend_info) -> nix::Resul
 pub unsafe fn fe_apply_properties(fd: RawFd, props: &dtv_properties) -> nix::Result<()> {
     unsafe { fe_set_property(fd, props as *const _).map(|_| ()) }
 }
+
+/// `FE_GET_PROPERTY`: the driver fills in the `u` union of each property
+/// whose `cmd` was set by the caller. Takes `&mut` because the ioctl is
+/// declared `_IOWR` and writes through the pointer.
+pub unsafe fn fe_read_properties(fd: RawFd, props: &mut dtv_properties) -> nix::Result<()> {
+    unsafe { fe_get_property(fd, props as *mut _).map(|_| ()) }
+}
